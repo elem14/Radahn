@@ -4,6 +4,7 @@ target_sources(
     radahn_domain
     PRIVATE
         src/version.cpp
+        src/job_state.cpp
 )
 
 target_include_directories(
