@@ -53,3 +53,22 @@ add_test(
     NAME radahn.scheduler
     COMMAND radahn-scheduler-tests
 )
+
+
+add_executable(
+    radahn-job-queue-tests
+    unit/job_queue_tests.cpp
+)
+
+target_link_libraries(
+    radahn-job-queue-tests
+    PRIVATE
+        radahn_scheduler
+        radahn_project_options
+        radahn_project_warnings
+)
+
+add_test(
+    NAME radahn.job_queue
+    COMMAND radahn-job-queue-tests
+)
