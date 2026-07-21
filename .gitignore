@@ -1,0 +1,33 @@
+# Build output
+build/
+out/
+cmake-build-*/
+
+# vcpkg installed dependencies
+vcpkg_installed/
+
+# CMake
+CMakeUserPresets.json
+CMakeCache.txt
+CMakeFiles/
+compile_commands.json
+
+# macOS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs and runtime state
+*.log
+data/
+tmp/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+config/local.*
