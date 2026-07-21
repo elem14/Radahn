@@ -5,6 +5,9 @@ target_sources(
     PRIVATE
         src/version.cpp
         src/job_state.cpp
+        src/resource.cpp
+        src/worker.cpp
+        src/worker_eligibility.cpp
 )
 
 target_include_directories(
