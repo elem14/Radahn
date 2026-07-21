@@ -36,4 +36,4 @@ public:
     JobState state
 ) noexcept;
 
-}  // namespace radahn::domain
+} // namespace radahn::domain

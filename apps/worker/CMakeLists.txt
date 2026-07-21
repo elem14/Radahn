@@ -1,4 +1,7 @@
-add_executable(radahn-worker main.cpp)
+add_executable(
+    radahn-worker
+    main.cpp
+)
 
 target_link_libraries(
     radahn-worker

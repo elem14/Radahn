@@ -16,6 +16,7 @@ add_test(
     COMMAND radahn-domain-tests
 )
 
+
 add_executable(
     radahn-resource-tests
     unit/resource_tests.cpp
@@ -32,4 +33,23 @@ target_link_libraries(
 add_test(
     NAME radahn.resources
     COMMAND radahn-resource-tests
+)
+
+
+add_executable(
+    radahn-scheduler-tests
+    unit/scheduler_tests.cpp
+)
+
+target_link_libraries(
+    radahn-scheduler-tests
+    PRIVATE
+        radahn_scheduler
+        radahn_project_options
+        radahn_project_warnings
+)
+
+add_test(
+    NAME radahn.scheduler
+    COMMAND radahn-scheduler-tests
 )
