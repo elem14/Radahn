@@ -110,3 +110,22 @@ add_test(
     NAME radahn.worker_record
     COMMAND radahn-worker-record-tests
 )
+
+
+add_executable(
+    radahn-in-memory-coordinator-tests
+    unit/in_memory_coordinator_tests.cpp
+)
+
+target_link_libraries(
+    radahn-in-memory-coordinator-tests
+    PRIVATE
+        radahn_coordinator
+        radahn_project_options
+        radahn_project_warnings
+)
+
+add_test(
+    NAME radahn.in_memory_coordinator
+    COMMAND radahn-in-memory-coordinator-tests
+)
