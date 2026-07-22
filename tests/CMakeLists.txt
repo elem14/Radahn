@@ -72,3 +72,22 @@ add_test(
     NAME radahn.job_queue
     COMMAND radahn-job-queue-tests
 )
+
+
+add_executable(
+    radahn-dispatch-planner-tests
+    unit/dispatch_planner_tests.cpp
+)
+
+target_link_libraries(
+    radahn-dispatch-planner-tests
+    PRIVATE
+        radahn_scheduler
+        radahn_project_options
+        radahn_project_warnings
+)
+
+add_test(
+    NAME radahn.dispatch_planner
+    COMMAND radahn-dispatch-planner-tests
+)

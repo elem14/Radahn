@@ -9,12 +9,18 @@
 
 namespace radahn::scheduler {
 
+using OrderedJobs =
+    std::vector<const domain::Job*>;
+
 class InMemoryJobQueue {
 public:
     void enqueue(domain::Job job);
 
     [[nodiscard]] std::optional<domain::Job>
     pop_next();
+
+    [[nodiscard]] OrderedJobs
+    ordered_jobs() const;
 
     [[nodiscard]] bool contains(
         const domain::JobId& job_id

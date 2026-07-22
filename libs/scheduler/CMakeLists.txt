@@ -7,6 +7,7 @@ target_sources(
         src/round_robin_policy.cpp
         src/least_loaded_policy.cpp
         src/job_queue.cpp
+        src/dispatch_planner.cpp
 )
 
 target_include_directories(

@@ -21,7 +21,6 @@ RoundRobinPolicy::select_worker(
     );
 
     if (candidates.empty()) {
-        next_index_ = 0;
         return std::nullopt;
     }
 

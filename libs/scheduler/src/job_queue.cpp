@@ -1,3 +1,7 @@
+// select jobs in order of highest priority
+// for equal priority -> older job first -> smallest job ID
+
+
 #include "radahn/scheduler/job_queue.hpp"
 
 #include <algorithm>
@@ -64,6 +68,29 @@ InMemoryJobQueue::pop_next() {
     jobs_.erase(best_job);
 
     return selected_job;
+}
+
+OrderedJobs InMemoryJobQueue::ordered_jobs() const {
+    OrderedJobs ordered;
+
+    ordered.reserve(jobs_.size());
+
+    for (const auto& job : jobs_) {
+        ordered.push_back(&job);
+    }
+
+    std::sort(
+        ordered.begin(),
+        ordered.end(),
+        [](const auto* left, const auto* right) {
+            return should_run_before(
+                *left,
+                *right
+            );
+        }
+    );
+
+    return ordered;
 }
 
 bool InMemoryJobQueue::contains(
