@@ -387,6 +387,57 @@ void test_empty_queue_returns_nothing() {
     );
 }
 
+void test_take_specific_job() {
+    using radahn::domain::Job;
+    using radahn::domain::JobId;
+    using radahn::scheduler::InMemoryJobQueue;
+
+    const Job::TimePoint base_time{};
+
+    InMemoryJobQueue queue;
+
+    queue.enqueue(
+        make_job(
+            "job-a",
+            100,
+            base_time
+        )
+    );
+
+    queue.enqueue(
+        make_job(
+            "job-b",
+            50,
+            base_time
+        )
+    );
+
+    const auto selected = queue.take(
+        JobId{"job-b"}
+    );
+
+    expect(
+        selected.has_value() &&
+        selected->id().value() == "job-b",
+        "Queue extracts the requested job"
+    );
+
+    expect(
+        queue.contains(JobId{"job-a"}),
+        "Extracting one job preserves other jobs"
+    );
+
+    expect(
+        !queue.contains(JobId{"job-b"}),
+        "Extracted job is removed from queue"
+    );
+
+    expect(
+        queue.size() == 1,
+        "Queue size decreases after extraction"
+    );
+}
+
 }  // namespace
 
 int main() {
@@ -400,6 +451,7 @@ int main() {
     test_duplicate_job_rejected();
     test_nonqueued_job_rejected();
     test_empty_queue_returns_nothing();
+    test_take_specific_job();
 
     if (failure_count != 0) {
         std::cerr

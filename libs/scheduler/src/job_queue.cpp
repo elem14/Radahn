@@ -70,6 +70,30 @@ InMemoryJobQueue::pop_next() {
     return selected_job;
 }
 
+std::optional<domain::Job>
+InMemoryJobQueue::take(
+    const domain::JobId& job_id
+) {
+    const auto iterator = std::find_if(
+        jobs_.begin(),
+        jobs_.end(),
+        [&job_id](const domain::Job& job) {
+            return job.id() == job_id;
+        }
+    );
+
+    if (iterator == jobs_.end()) {
+        return std::nullopt;
+    }
+
+    domain::Job selected_job =
+        std::move(*iterator);
+
+    jobs_.erase(iterator);
+
+    return selected_job;
+}
+
 OrderedJobs InMemoryJobQueue::ordered_jobs() const {
     OrderedJobs ordered;
 

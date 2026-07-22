@@ -19,6 +19,9 @@ public:
     [[nodiscard]] std::optional<domain::Job>
     pop_next();
 
+    [[nodiscard]] std::optional<domain::Job>
+    take(const domain::JobId& job_id);
+
     [[nodiscard]] OrderedJobs
     ordered_jobs() const;
 

@@ -9,6 +9,7 @@ target_sources(
         src/worker.cpp
         src/worker_eligibility.cpp
         src/job.cpp
+        src/worker_record.cpp
 )
 
 target_include_directories(

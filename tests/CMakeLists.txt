@@ -91,3 +91,22 @@ add_test(
     NAME radahn.dispatch_planner
     COMMAND radahn-dispatch-planner-tests
 )
+
+
+add_executable(
+    radahn-worker-record-tests
+    unit/worker_record_tests.cpp
+)
+
+target_link_libraries(
+    radahn-worker-record-tests
+    PRIVATE
+        radahn_domain
+        radahn_project_options
+        radahn_project_warnings
+)
+
+add_test(
+    NAME radahn.worker_record
+    COMMAND radahn-worker-record-tests
+)
