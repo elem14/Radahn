@@ -1,0 +1,9 @@
+{
+  "name": "radahn",
+  "version-string": "0.2.0",
+  "description": "Distributed experiment and batch-computing platform",
+  "dependencies": [
+    "grpc",
+    "protobuf"
+  ]
+}

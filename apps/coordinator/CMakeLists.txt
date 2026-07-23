@@ -4,9 +4,10 @@ add_executable(
 )
 
 target_link_libraries(
-    radahn-coordinator
+    radahn-coordinator 
     PRIVATE
-        radahn_domain
+        radahn_coordinator
+        radahn_proto
         radahn_project_options
         radahn_project_warnings
 )

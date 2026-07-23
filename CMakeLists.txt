@@ -69,6 +69,8 @@ add_subdirectory(libs/domain)
 add_subdirectory(libs/scheduler)
 add_subdirectory(libs/coordinator)
 
+add_subdirectory(proto)
+
 add_subdirectory(apps/coordinator)
 add_subdirectory(apps/worker)
 add_subdirectory(apps/cli)
