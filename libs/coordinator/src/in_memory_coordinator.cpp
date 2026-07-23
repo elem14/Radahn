@@ -304,6 +304,28 @@ InMemoryCoordinator::list_jobs() const {
     return jobs;
 }
 
+std::optional<domain::Job>
+InMemoryCoordinator::leased_job_for_worker(
+    const domain::WorkerId& worker_id
+) const {
+    const auto iterator = std::find_if(
+        active_jobs_.begin(),
+        active_jobs_.end(),
+        [&worker_id](const ActiveJob& active_job) {
+            return
+                active_job.worker_id == worker_id &&
+                active_job.job.state() ==
+                    domain::JobState::leased;
+        }
+    );
+
+    if (iterator == active_jobs_.end()) {
+        return std::nullopt;
+    }
+
+    return iterator->job;
+}
+
 std::optional<domain::WorkerSnapshot>
 InMemoryCoordinator::worker_snapshot(
     const domain::WorkerId& worker_id

@@ -1,26 +1,36 @@
 find_package(Protobuf CONFIG REQUIRED)
 find_package(gRPC CONFIG REQUIRED)
 
-set(RADAHN_PROTO_FILE
+set(
+    RADAHN_PROTO_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/client_service.proto
+    ${CMAKE_CURRENT_SOURCE_DIR}/worker_service.proto
 )
 
-set(RADAHN_PROTO_GENERATED_DIR
+set(
+    RADAHN_PROTO_GENERATED_DIR
     ${CMAKE_CURRENT_BINARY_DIR}/generated
 )
 
-file(MAKE_DIRECTORY
+file(
+    MAKE_DIRECTORY
     ${RADAHN_PROTO_GENERATED_DIR}
 )
 
-set(RADAHN_PROTO_SOURCES
+set(
+    RADAHN_PROTO_SOURCES
     ${RADAHN_PROTO_GENERATED_DIR}/client_service.pb.cc
     ${RADAHN_PROTO_GENERATED_DIR}/client_service.grpc.pb.cc
+    ${RADAHN_PROTO_GENERATED_DIR}/worker_service.pb.cc
+    ${RADAHN_PROTO_GENERATED_DIR}/worker_service.grpc.pb.cc
 )
 
-set(RADAHN_PROTO_HEADERS
+set(
+    RADAHN_PROTO_HEADERS
     ${RADAHN_PROTO_GENERATED_DIR}/client_service.pb.h
     ${RADAHN_PROTO_GENERATED_DIR}/client_service.grpc.pb.h
+    ${RADAHN_PROTO_GENERATED_DIR}/worker_service.pb.h
+    ${RADAHN_PROTO_GENERATED_DIR}/worker_service.grpc.pb.h
 )
 
 add_custom_command(
@@ -36,10 +46,10 @@ add_custom_command(
         --cpp_out=${RADAHN_PROTO_GENERATED_DIR}
         --grpc_out=${RADAHN_PROTO_GENERATED_DIR}
         --plugin=protoc-gen-grpc=$<TARGET_FILE:gRPC::grpc_cpp_plugin>
-        ${RADAHN_PROTO_FILE}
+        ${RADAHN_PROTO_FILES}
 
     DEPENDS
-        ${RADAHN_PROTO_FILE}
+        ${RADAHN_PROTO_FILES}
 
     COMMENT
         "Generating Radahn Protocol Buffer and gRPC sources"

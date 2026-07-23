@@ -1,22 +1,30 @@
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 #include <grpcpp/grpcpp.h>
 
 #include "client_service.grpc.pb.h"
+#include "worker_service.grpc.pb.h"
+
 #include "radahn/coordinator/in_memory_coordinator.hpp"
 #include "radahn/domain/id.hpp"
 #include "radahn/domain/job.hpp"
 #include "radahn/domain/job_state.hpp"
 #include "radahn/domain/resource.hpp"
 #include "radahn/domain/version.hpp"
+#include "radahn/domain/worker.hpp"
+#include "radahn/domain/worker_record.hpp"
 #include "radahn/scheduler/least_loaded_policy.hpp"
 
 namespace {
@@ -64,14 +72,17 @@ void fill_job_info(
     output->set_name(job.name());
 
     output->set_priority(
-        static_cast<std::int32_t>(job.priority())
+        static_cast<std::int32_t>(
+            job.priority()
+        )
     );
 
     output->set_state(
         to_rpc_job_state(job.state())
     );
 
-    auto* requirements = output->mutable_requirements();
+    auto* requirements =
+        output->mutable_requirements();
 
     requirements->set_cpu_cores(
         job.requirements().cpu_cores()
@@ -108,8 +119,8 @@ void fill_job_info(
     );
 }
 
-[[nodiscard]]
-std::vector<std::string> copy_required_tags(
+[[nodiscard]] std::vector<std::string>
+copy_required_tags(
     const rpc::ResourceRequirements& requirements
 ) {
     std::vector<std::string> tags;
@@ -128,10 +139,49 @@ std::vector<std::string> copy_required_tags(
     return tags;
 }
 
-class ClientServiceImpl final
-    : public rpc::ClientService::Service {
+[[nodiscard]] std::vector<std::string>
+copy_worker_tags(
+    const rpc::RegisterWorkerRequest& request
+) {
+    std::vector<std::string> tags;
+
+    tags.reserve(
+        static_cast<std::size_t>(
+            request.tags_size()
+        )
+    );
+
+    for (const auto& tag : request.tags()) {
+        tags.push_back(tag);
+    }
+
+    return tags;
+}
+
+[[nodiscard]] std::size_t checked_size_t(
+    std::uint64_t value,
+    std::string_view field_name
+) {
+    if (
+        value >
+        static_cast<std::uint64_t>(
+            std::numeric_limits<std::size_t>::max()
+        )
+    ) {
+        throw std::invalid_argument{
+            std::string{field_name} +
+            " is outside the supported range"
+        };
+    }
+
+    return static_cast<std::size_t>(value);
+}
+
+class CoordinatorServiceImpl final
+    : public rpc::ClientService::Service,
+      public rpc::WorkerService::Service {
 public:
-    ClientServiceImpl()
+    CoordinatorServiceImpl()
         : coordinator_{policy_} {
     }
 
@@ -185,14 +235,20 @@ public:
             domain::Job job{
                 job_id,
                 request->name(),
-                static_cast<int>(request->priority()),
+                static_cast<int>(
+                    request->priority()
+                ),
                 std::move(requirements)
             };
 
             {
                 const std::lock_guard lock{mutex_};
 
-                if (coordinator_.get_job(job_id).has_value()) {
+                if (
+                    coordinator_.get_job(
+                        job_id
+                    ).has_value()
+                ) {
                     return grpc::Status{
                         grpc::StatusCode::ALREADY_EXISTS,
                         "A job with this ID already exists"
@@ -238,7 +294,9 @@ public:
             {
                 const std::lock_guard lock{mutex_};
 
-                job = coordinator_.get_job(job_id);
+                job = coordinator_.get_job(
+                    job_id
+                );
             }
 
             if (!job.has_value()) {
@@ -300,9 +358,183 @@ public:
         }
     }
 
+    grpc::Status RegisterWorker(
+        grpc::ServerContext* context,
+        const rpc::RegisterWorkerRequest* request,
+        rpc::RegisterWorkerResponse* response
+    ) override {
+        static_cast<void>(context);
+
+        try {
+            if (!request->has_resources()) {
+                return grpc::Status{
+                    grpc::StatusCode::INVALID_ARGUMENT,
+                    "Worker resources are required"
+                };
+            }
+
+            const domain::WorkerId worker_id{
+                request->worker_id()
+            };
+
+            const std::size_t running_jobs =
+                checked_size_t(
+                    request->running_jobs(),
+                    "running_jobs"
+                );
+
+            const std::size_t max_concurrent_jobs =
+                checked_size_t(
+                    request->max_concurrent_jobs(),
+                    "max_concurrent_jobs"
+                );
+
+            const auto& rpc_resources =
+                request->resources();
+
+            domain::WorkerResources resources{
+                rpc_resources.total_cpu_cores(),
+                rpc_resources.available_cpu_cores(),
+                rpc_resources.total_memory_bytes(),
+                rpc_resources.available_memory_bytes(),
+                rpc_resources.total_disk_bytes(),
+                rpc_resources.available_disk_bytes(),
+                rpc_resources.gpu_available()
+            };
+
+            domain::WorkerSnapshot snapshot{
+                worker_id,
+                domain::WorkerState::online,
+                std::move(resources),
+                running_jobs,
+                max_concurrent_jobs,
+                copy_worker_tags(*request)
+            };
+
+            bool already_registered = false;
+
+            {
+                const std::lock_guard lock{mutex_};
+
+                already_registered =
+                    coordinator_.worker_snapshot(
+                        worker_id
+                    ).has_value();
+
+                if (!already_registered) {
+                    coordinator_.register_worker(
+                        domain::WorkerRecord{
+                            std::move(snapshot)
+                        }
+                    );
+                }
+            }
+
+            response->set_worker_id(
+                worker_id.value()
+            );
+
+            response->set_already_registered(
+                already_registered
+            );
+
+            return grpc::Status::OK;
+        } catch (const std::invalid_argument& error) {
+            return grpc::Status{
+                grpc::StatusCode::INVALID_ARGUMENT,
+                error.what()
+            };
+        } catch (const std::exception& error) {
+            return grpc::Status{
+                grpc::StatusCode::INTERNAL,
+                error.what()
+            };
+        }
+    }
+
+    grpc::Status AcquireJob(
+        grpc::ServerContext* context,
+        const rpc::AcquireJobRequest* request,
+        rpc::AcquireJobResponse* response
+    ) override {
+        static_cast<void>(context);
+
+        try {
+            const domain::WorkerId worker_id{
+                request->worker_id()
+            };
+
+            std::optional<domain::Job> assigned_job;
+
+            {
+                const std::lock_guard lock{mutex_};
+
+                if (
+                    !coordinator_.worker_snapshot(
+                        worker_id
+                    ).has_value()
+                ) {
+                    return grpc::Status{
+                        grpc::StatusCode::NOT_FOUND,
+                        "Worker is not registered"
+                    };
+                }
+
+                assigned_job =
+                    coordinator_.leased_job_for_worker(
+                        worker_id
+                    );
+
+                if (!assigned_job.has_value()) {
+                    while (true) {
+                        const auto decision =
+                            coordinator_.dispatch_once();
+
+                        if (!decision.has_value()) {
+                            break;
+                        }
+
+                        if (
+                            decision->worker_id ==
+                            worker_id
+                        ) {
+                            break;
+                        }
+                    }
+
+                    assigned_job =
+                        coordinator_.leased_job_for_worker(
+                            worker_id
+                        );
+                }
+            }
+
+            if (!assigned_job.has_value()) {
+                return grpc::Status::OK;
+            }
+            
+            fill_job_info(
+                *assigned_job,
+                response->mutable_job()
+            );
+
+            return grpc::Status::OK;
+        } catch (const std::invalid_argument& error) {
+            return grpc::Status{
+                grpc::StatusCode::INVALID_ARGUMENT,
+                error.what()
+            };
+        } catch (const std::exception& error) {
+            return grpc::Status{
+                grpc::StatusCode::INTERNAL,
+                error.what()
+            };
+        }
+    }
+
 private:
-    // policy_ must be declared before coordinator_ because
-    // coordinator_ stores a reference to it.
+    // The coordinator stores a reference to the policy,
+    // so the policy must be constructed first and destroyed last.
     radahn::scheduler::LeastLoadedPolicy policy_;
 
     radahn::coordinator::InMemoryCoordinator
@@ -318,7 +550,7 @@ int main() {
         "0.0.0.0:50051"
     };
 
-    ClientServiceImpl service;
+    CoordinatorServiceImpl service;
 
     grpc::ServerBuilder builder;
 
@@ -327,7 +559,17 @@ int main() {
         grpc::InsecureServerCredentials()
     );
 
-    builder.RegisterService(&service);
+    builder.RegisterService(
+        static_cast<
+            rpc::ClientService::Service*
+        >(&service)
+    );
+
+    builder.RegisterService(
+        static_cast<
+            rpc::WorkerService::Service*
+        >(&service)
+    );
 
     std::unique_ptr<grpc::Server> server{
         builder.BuildAndStart()

@@ -497,7 +497,57 @@ void test_job_queries() {
     );
 }
 
+void test_leased_job_query_by_worker() {
+    using radahn::coordinator::InMemoryCoordinator;
+    using radahn::domain::WorkerId;
+    using radahn::scheduler::LeastLoadedPolicy;
 
+    LeastLoadedPolicy policy;
+    InMemoryCoordinator coordinator{policy};
+
+    coordinator.register_worker(
+        make_worker(
+            "worker-1",
+            8.0,
+            0,
+            4
+        )
+    );
+
+    coordinator.submit_job(
+        make_job(
+            "job-1",
+            50,
+            make_cpu_requirements()
+        )
+    );
+
+    const auto decision =
+        coordinator.dispatch_once();
+
+    expect(
+        decision.has_value(),
+        "Job is dispatched for leased-job query"
+    );
+
+    const auto assigned_job =
+        coordinator.leased_job_for_worker(
+            WorkerId{"worker-1"}
+        );
+
+    expect(
+        assigned_job.has_value() &&
+        assigned_job->id().value() == "job-1",
+        "Coordinator finds leased job by worker"
+    );
+
+    expect(
+        !coordinator.leased_job_for_worker(
+            WorkerId{"unknown-worker"}
+        ).has_value(),
+        "Unknown worker has no leased job"
+    );
+}
 
 }  // namespace
 
@@ -507,6 +557,8 @@ int main() {
     test_duplicate_worker_rejected();
     test_duplicate_job_rejected_while_active();
     test_no_dispatch_without_work();
+    test_job_queries();
+    test_leased_job_query_by_worker();
 
     if (failure_count != 0) {
         std::cerr

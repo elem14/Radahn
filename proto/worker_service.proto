@@ -1,0 +1,48 @@
+syntax = "proto3";
+
+package radahn.rpc.v1;
+
+import "client_service.proto";
+
+service WorkerService {
+  rpc RegisterWorker(RegisterWorkerRequest)
+      returns (RegisterWorkerResponse);
+
+  rpc AcquireJob(AcquireJobRequest)
+      returns (AcquireJobResponse);
+}
+
+message WorkerResources {
+  double total_cpu_cores = 1;
+  double available_cpu_cores = 2;
+
+  uint64 total_memory_bytes = 3;
+  uint64 available_memory_bytes = 4;
+
+  uint64 total_disk_bytes = 5;
+  uint64 available_disk_bytes = 6;
+
+  bool gpu_available = 7;
+}
+
+message RegisterWorkerRequest {
+  string worker_id = 1;
+  WorkerResources resources = 2;
+  uint64 running_jobs = 3;
+  uint64 max_concurrent_jobs = 4;
+  repeated string tags = 5;
+}
+
+message RegisterWorkerResponse {
+  string worker_id = 1;
+  bool already_registered = 2;
+}
+
+message AcquireJobRequest {
+  string worker_id = 1;
+}
+
+message AcquireJobResponse {
+  reserved 1;
+  JobInfo job = 2;
+}

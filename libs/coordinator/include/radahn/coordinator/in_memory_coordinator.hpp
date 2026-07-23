@@ -67,6 +67,12 @@ public:
     std::vector<domain::Job> list_jobs() const;
 
     [[nodiscard]]
+    std::optional<domain::Job>
+    leased_job_for_worker(
+        const domain::WorkerId& worker_id
+    ) const;
+
+    [[nodiscard]]
     std::optional<domain::WorkerSnapshot>
     worker_snapshot(
         const domain::WorkerId& worker_id
