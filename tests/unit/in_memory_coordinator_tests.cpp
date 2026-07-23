@@ -443,6 +443,62 @@ void test_no_dispatch_without_work() {
     );
 }
 
+void test_job_queries() {
+    using radahn::coordinator::InMemoryCoordinator;
+    using radahn::domain::JobId;
+    using radahn::scheduler::LeastLoadedPolicy;
+
+    LeastLoadedPolicy policy;
+    InMemoryCoordinator coordinator{policy};
+
+    coordinator.submit_job(
+        make_job(
+            "job-1",
+            100,
+            make_cpu_requirements()
+        )
+    );
+
+    coordinator.submit_job(
+        make_job(
+            "job-2",
+            50,
+            make_cpu_requirements()
+        )
+    );
+
+    const auto job = coordinator.get_job(
+        JobId{"job-1"}
+    );
+
+    expect(
+        job.has_value(),
+        "Coordinator retrieves an existing job"
+    );
+
+    expect(
+        job.has_value() &&
+        job->priority() == 100,
+        "Retrieved job preserves its priority"
+    );
+
+    const auto jobs = coordinator.list_jobs();
+
+    expect(
+        jobs.size() == 2,
+        "Coordinator lists all submitted jobs"
+    );
+
+    expect(
+        !coordinator.get_job(
+            JobId{"missing-job"}
+        ).has_value(),
+        "Coordinator returns nothing for unknown job"
+    );
+}
+
+
+
 }  // namespace
 
 int main() {

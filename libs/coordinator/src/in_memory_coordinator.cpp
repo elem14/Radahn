@@ -234,6 +234,76 @@ InMemoryCoordinator::job_state(
     return std::nullopt;
 }
 
+std::optional<domain::Job>
+InMemoryCoordinator::get_job(
+    const domain::JobId& job_id
+) const {
+    for (const auto* queued_job : queue_.ordered_jobs()) {
+        if (queued_job->id() == job_id) {
+            return *queued_job;
+        }
+    }
+
+    const auto* active_job = find_active_job(job_id);
+
+    if (active_job != nullptr) {
+        return active_job->job;
+    }
+
+    const auto finished_iterator = std::find_if(
+        finished_jobs_.begin(),
+        finished_jobs_.end(),
+        [&job_id](const domain::Job& job) {
+            return job.id() == job_id;
+        }
+    );
+
+    if (finished_iterator != finished_jobs_.end()) {
+        return *finished_iterator;
+    }
+
+    return std::nullopt;
+}
+
+std::vector<domain::Job>
+InMemoryCoordinator::list_jobs() const {
+    std::vector<domain::Job> jobs;
+
+    jobs.reserve(
+        queue_.size() +
+        active_jobs_.size() +
+        finished_jobs_.size()
+    );
+
+    for (const auto* queued_job : queue_.ordered_jobs()) {
+        jobs.push_back(*queued_job);
+    }
+
+    for (const auto& active_job : active_jobs_) {
+        jobs.push_back(active_job.job);
+    }
+
+    for (const auto& finished_job : finished_jobs_) {
+        jobs.push_back(finished_job);
+    }
+
+    std::sort(
+        jobs.begin(),
+        jobs.end(),
+        [](const domain::Job& left,
+           const domain::Job& right) {
+            if (left.created_at() != right.created_at()) {
+                return left.created_at() < right.created_at();
+            }
+
+            return left.id().value() <
+                   right.id().value();
+        }
+    );
+
+    return jobs;
+}
+
 std::optional<domain::WorkerSnapshot>
 InMemoryCoordinator::worker_snapshot(
     const domain::WorkerId& worker_id

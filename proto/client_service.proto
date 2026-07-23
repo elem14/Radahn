@@ -4,6 +4,15 @@ package radahn.rpc.v1;
 
 service ClientService {
   rpc Ping(PingRequest) returns (PingResponse);
+
+  rpc SubmitJob(SubmitJobRequest)
+      returns (SubmitJobResponse);
+
+  rpc GetJob(GetJobRequest)
+      returns (GetJobResponse);
+
+  rpc ListJobs(ListJobsRequest)
+      returns (ListJobsResponse);
 }
 
 message PingRequest {
@@ -13,4 +22,59 @@ message PingRequest {
 message PingResponse {
   string message = 1;
   string coordinator_version = 2;
+}
+
+enum JobState {
+  JOB_STATE_UNSPECIFIED = 0;
+  JOB_STATE_QUEUED = 1;
+  JOB_STATE_LEASED = 2;
+  JOB_STATE_RUNNING = 3;
+  JOB_STATE_RETRY_WAIT = 4;
+  JOB_STATE_CANCELLATION_REQUESTED = 5;
+  JOB_STATE_SUCCEEDED = 6;
+  JOB_STATE_FAILED = 7;
+  JOB_STATE_CANCELLED = 8;
+}
+
+message ResourceRequirements {
+  double cpu_cores = 1;
+  uint64 memory_bytes = 2;
+  uint64 disk_bytes = 3;
+  bool requires_gpu = 4;
+  repeated string required_tags = 5;
+}
+
+message JobInfo {
+  string id = 1;
+  string name = 2;
+  int32 priority = 3;
+  JobState state = 4;
+  ResourceRequirements requirements = 5;
+  int64 created_at_unix_ms = 6;
+}
+
+message SubmitJobRequest {
+  string id = 1;
+  string name = 2;
+  int32 priority = 3;
+  ResourceRequirements requirements = 4;
+}
+
+message SubmitJobResponse {
+  JobInfo job = 1;
+}
+
+message GetJobRequest {
+  string id = 1;
+}
+
+message GetJobResponse {
+  JobInfo job = 1;
+}
+
+message ListJobsRequest {
+}
+
+message ListJobsResponse {
+  repeated JobInfo jobs = 1;
 }

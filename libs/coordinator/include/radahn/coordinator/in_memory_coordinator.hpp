@@ -59,6 +59,14 @@ public:
     ) const;
 
     [[nodiscard]]
+    std::optional<domain::Job> get_job(
+        const domain::JobId& job_id
+    ) const;
+
+    [[nodiscard]]
+    std::vector<domain::Job> list_jobs() const;
+
+    [[nodiscard]]
     std::optional<domain::WorkerSnapshot>
     worker_snapshot(
         const domain::WorkerId& worker_id
