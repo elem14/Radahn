@@ -129,3 +129,22 @@ add_test(
     NAME radahn.in_memory_coordinator
     COMMAND radahn-in-memory-coordinator-tests
 )
+
+add_executable(
+    radahn-persistence-tests
+    unit/persistence_tests.cpp
+)
+
+target_link_libraries(
+    radahn-persistence-tests
+    PRIVATE
+        radahn_persistence
+        radahn_domain
+        radahn_project_options
+        radahn_project_warnings
+)
+
+add_test(
+    NAME radahn.persistence
+    COMMAND radahn-persistence-tests
+)

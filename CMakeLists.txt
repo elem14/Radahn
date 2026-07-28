@@ -66,6 +66,7 @@ endif()
 enable_testing()
 
 add_subdirectory(libs/domain)
+add_subdirectory(libs/persistence)
 add_subdirectory(libs/scheduler)
 add_subdirectory(libs/coordinator)
 
