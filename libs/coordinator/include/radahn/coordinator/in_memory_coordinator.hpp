@@ -78,6 +78,18 @@ public:
         const domain::WorkerId& worker_id
     ) const;
 
+    [[nodiscard]]
+    std::optional<scheduler::DispatchDecision>
+    dispatch_once_for_worker(
+        const domain::WorkerId& worker_id
+    );
+
+    [[nodiscard]]
+    bool is_job_assigned_to_worker(
+        const domain::JobId& job_id,
+        const domain::WorkerId& worker_id
+    ) const;
+
 private:
     struct ActiveJob {
         domain::Job job;
@@ -112,6 +124,10 @@ private:
     void finish_job(
         const domain::JobId& job_id,
         domain::JobState terminal_state
+    );
+
+    void apply_dispatch_decision(
+        const scheduler::DispatchDecision& decision
     );
 
     scheduler::InMemoryJobQueue queue_;

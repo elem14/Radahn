@@ -1,10 +1,13 @@
 #include "radahn/coordinator/in_memory_coordinator.hpp"
 
 #include <algorithm>
+#include <array>
 #include <span>
 #include <stdexcept>
 #include <utility>
 #include <vector>
+
+#include "radahn/domain/job_state.hpp"
 
 namespace radahn::coordinator {
 
@@ -45,7 +48,9 @@ InMemoryCoordinator::dispatch_once() {
     snapshots.reserve(workers_.size());
 
     for (const auto& worker : workers_) {
-        snapshots.push_back(worker.snapshot());
+        snapshots.push_back(
+            worker.snapshot()
+        );
     }
 
     const auto decision = planner_.plan(
@@ -59,97 +64,40 @@ InMemoryCoordinator::dispatch_once() {
         return std::nullopt;
     }
 
-    auto* selected_worker = find_worker(
-        decision->worker_id
-    );
+    apply_dispatch_decision(*decision);
 
-    if (selected_worker == nullptr) {
-        throw std::logic_error{
-            "Dispatch planner selected an unknown worker"
+    return decision;
+}
+
+std::optional<scheduler::DispatchDecision>
+InMemoryCoordinator::dispatch_once_for_worker(
+    const domain::WorkerId& worker_id
+) {
+    const auto* worker = find_worker(worker_id);
+
+    if (worker == nullptr) {
+        throw std::invalid_argument{
+            "Cannot dispatch to an unknown worker"
         };
     }
 
-    auto selected_job = queue_.take(
-        decision->job_id
+    const std::array<domain::WorkerSnapshot, 1>
+        snapshots{
+            worker->snapshot()
+        };
+
+    const auto decision = planner_.plan(
+        queue_,
+        std::span<const domain::WorkerSnapshot>{
+            snapshots
+        }
     );
 
-    if (!selected_job.has_value()) {
-        throw std::logic_error{
-            "Dispatch planner selected an unknown job"
-        };
+    if (!decision.has_value()) {
+        return std::nullopt;
     }
 
-    // Preserve the original queued job for rollback if applying
-    // the dispatch decision unexpectedly fails.
-    domain::Job rollback_job = *selected_job;
-
-    try {
-        selected_worker->reserve(
-            selected_job->requirements()
-        );
-
-        selected_job->transition_to(
-            domain::JobState::leased
-        );
-
-        active_jobs_.push_back(
-            ActiveJob{
-                std::move(*selected_job),
-                decision->worker_id
-            }
-        );
-    } catch (...) {
-        const auto current_snapshot =
-            selected_worker->snapshot();
-
-        if (current_snapshot.running_jobs() >
-            rollback_job.requirements().cpu_cores() * 0.0) {
-            // release() itself verifies that resources were
-            // actually reserved before restoring them.
-            bool resources_reserved = false;
-
-            try {
-                selected_worker->reserve(
-                    selected_job->requirements()
-                );
-
-                resources_reserved = true;
-
-                selected_job->transition_to(
-                    domain::JobState::leased
-                );
-
-                active_jobs_.push_back(
-                    ActiveJob{
-                        std::move(*selected_job),
-                        decision->worker_id
-                    }
-                );
-            } catch (...) {
-                if (resources_reserved) {
-                    try {
-                        selected_worker->release(
-                            rollback_job.requirements()
-                        );
-                    } catch (...) {
-                        // Preserve the original exception.
-                    }
-                }
-
-                if (!queue_.contains(rollback_job.id())) {
-                    queue_.enqueue(std::move(rollback_job));
-                }
-
-                throw;
-            }
-        }
-
-        if (!queue_.contains(rollback_job.id())) {
-            queue_.enqueue(std::move(rollback_job));
-        }
-
-        throw;
-    }
+    apply_dispatch_decision(*decision);
 
     return decision;
 }
@@ -207,27 +155,33 @@ std::optional<domain::JobState>
 InMemoryCoordinator::job_state(
     const domain::JobId& job_id
 ) const {
-    for (const auto* queued_job : queue_.ordered_jobs()) {
+    for (const auto* queued_job :
+         queue_.ordered_jobs()) {
         if (queued_job->id() == job_id) {
             return queued_job->state();
         }
     }
 
-    const auto* active_job = find_active_job(job_id);
+    const auto* active_job =
+        find_active_job(job_id);
 
     if (active_job != nullptr) {
         return active_job->job.state();
     }
 
-    const auto finished_iterator = std::find_if(
-        finished_jobs_.begin(),
-        finished_jobs_.end(),
-        [&job_id](const domain::Job& job) {
-            return job.id() == job_id;
-        }
-    );
+    const auto finished_iterator =
+        std::find_if(
+            finished_jobs_.begin(),
+            finished_jobs_.end(),
+            [&job_id](const domain::Job& job) {
+                return job.id() == job_id;
+            }
+        );
 
-    if (finished_iterator != finished_jobs_.end()) {
+    if (
+        finished_iterator !=
+        finished_jobs_.end()
+    ) {
         return finished_iterator->state();
     }
 
@@ -238,27 +192,33 @@ std::optional<domain::Job>
 InMemoryCoordinator::get_job(
     const domain::JobId& job_id
 ) const {
-    for (const auto* queued_job : queue_.ordered_jobs()) {
+    for (const auto* queued_job :
+         queue_.ordered_jobs()) {
         if (queued_job->id() == job_id) {
             return *queued_job;
         }
     }
 
-    const auto* active_job = find_active_job(job_id);
+    const auto* active_job =
+        find_active_job(job_id);
 
     if (active_job != nullptr) {
         return active_job->job;
     }
 
-    const auto finished_iterator = std::find_if(
-        finished_jobs_.begin(),
-        finished_jobs_.end(),
-        [&job_id](const domain::Job& job) {
-            return job.id() == job_id;
-        }
-    );
+    const auto finished_iterator =
+        std::find_if(
+            finished_jobs_.begin(),
+            finished_jobs_.end(),
+            [&job_id](const domain::Job& job) {
+                return job.id() == job_id;
+            }
+        );
 
-    if (finished_iterator != finished_jobs_.end()) {
+    if (
+        finished_iterator !=
+        finished_jobs_.end()
+    ) {
         return *finished_iterator;
     }
 
@@ -275,15 +235,18 @@ InMemoryCoordinator::list_jobs() const {
         finished_jobs_.size()
     );
 
-    for (const auto* queued_job : queue_.ordered_jobs()) {
+    for (const auto* queued_job :
+         queue_.ordered_jobs()) {
         jobs.push_back(*queued_job);
     }
 
-    for (const auto& active_job : active_jobs_) {
+    for (const auto& active_job :
+         active_jobs_) {
         jobs.push_back(active_job.job);
     }
 
-    for (const auto& finished_job : finished_jobs_) {
+    for (const auto& finished_job :
+         finished_jobs_) {
         jobs.push_back(finished_job);
     }
 
@@ -292,12 +255,18 @@ InMemoryCoordinator::list_jobs() const {
         jobs.end(),
         [](const domain::Job& left,
            const domain::Job& right) {
-            if (left.created_at() != right.created_at()) {
-                return left.created_at() < right.created_at();
+            if (
+                left.created_at() !=
+                right.created_at()
+            ) {
+                return
+                    left.created_at() <
+                    right.created_at();
             }
 
-            return left.id().value() <
-                   right.id().value();
+            return
+                left.id().value() <
+                right.id().value();
         }
     );
 
@@ -308,16 +277,20 @@ std::optional<domain::Job>
 InMemoryCoordinator::leased_job_for_worker(
     const domain::WorkerId& worker_id
 ) const {
-    const auto iterator = std::find_if(
-        active_jobs_.begin(),
-        active_jobs_.end(),
-        [&worker_id](const ActiveJob& active_job) {
-            return
-                active_job.worker_id == worker_id &&
-                active_job.job.state() ==
-                    domain::JobState::leased;
-        }
-    );
+    const auto iterator =
+        std::find_if(
+            active_jobs_.begin(),
+            active_jobs_.end(),
+            [&worker_id](
+                const ActiveJob& active_job
+            ) {
+                return
+                    active_job.worker_id ==
+                        worker_id &&
+                    active_job.job.state() ==
+                        domain::JobState::leased;
+            }
+        );
 
     if (iterator == active_jobs_.end()) {
         return std::nullopt;
@@ -326,11 +299,24 @@ InMemoryCoordinator::leased_job_for_worker(
     return iterator->job;
 }
 
+bool InMemoryCoordinator::is_job_assigned_to_worker(
+    const domain::JobId& job_id,
+    const domain::WorkerId& worker_id
+) const {
+    const auto* active_job =
+        find_active_job(job_id);
+
+    return
+        active_job != nullptr &&
+        active_job->worker_id == worker_id;
+}
+
 std::optional<domain::WorkerSnapshot>
 InMemoryCoordinator::worker_snapshot(
     const domain::WorkerId& worker_id
 ) const {
-    const auto* worker = find_worker(worker_id);
+    const auto* worker =
+        find_worker(worker_id);
 
     if (worker == nullptr) {
         return std::nullopt;
@@ -343,13 +329,16 @@ domain::WorkerRecord*
 InMemoryCoordinator::find_worker(
     const domain::WorkerId& worker_id
 ) {
-    const auto iterator = std::find_if(
-        workers_.begin(),
-        workers_.end(),
-        [&worker_id](const domain::WorkerRecord& worker) {
-            return worker.id() == worker_id;
-        }
-    );
+    const auto iterator =
+        std::find_if(
+            workers_.begin(),
+            workers_.end(),
+            [&worker_id](
+                const domain::WorkerRecord& worker
+            ) {
+                return worker.id() == worker_id;
+            }
+        );
 
     if (iterator == workers_.end()) {
         return nullptr;
@@ -362,13 +351,16 @@ const domain::WorkerRecord*
 InMemoryCoordinator::find_worker(
     const domain::WorkerId& worker_id
 ) const {
-    const auto iterator = std::find_if(
-        workers_.begin(),
-        workers_.end(),
-        [&worker_id](const domain::WorkerRecord& worker) {
-            return worker.id() == worker_id;
-        }
-    );
+    const auto iterator =
+        std::find_if(
+            workers_.begin(),
+            workers_.end(),
+            [&worker_id](
+                const domain::WorkerRecord& worker
+            ) {
+                return worker.id() == worker_id;
+            }
+        );
 
     if (iterator == workers_.end()) {
         return nullptr;
@@ -381,13 +373,18 @@ InMemoryCoordinator::ActiveJob*
 InMemoryCoordinator::find_active_job(
     const domain::JobId& job_id
 ) {
-    const auto iterator = std::find_if(
-        active_jobs_.begin(),
-        active_jobs_.end(),
-        [&job_id](const ActiveJob& active_job) {
-            return active_job.job.id() == job_id;
-        }
-    );
+    const auto iterator =
+        std::find_if(
+            active_jobs_.begin(),
+            active_jobs_.end(),
+            [&job_id](
+                const ActiveJob& active_job
+            ) {
+                return
+                    active_job.job.id() ==
+                    job_id;
+            }
+        );
 
     if (iterator == active_jobs_.end()) {
         return nullptr;
@@ -400,13 +397,18 @@ const InMemoryCoordinator::ActiveJob*
 InMemoryCoordinator::find_active_job(
     const domain::JobId& job_id
 ) const {
-    const auto iterator = std::find_if(
-        active_jobs_.begin(),
-        active_jobs_.end(),
-        [&job_id](const ActiveJob& active_job) {
-            return active_job.job.id() == job_id;
-        }
-    );
+    const auto iterator =
+        std::find_if(
+            active_jobs_.begin(),
+            active_jobs_.end(),
+            [&job_id](
+                const ActiveJob& active_job
+            ) {
+                return
+                    active_job.job.id() ==
+                    job_id;
+            }
+        );
 
     if (iterator == active_jobs_.end()) {
         return nullptr;
@@ -435,19 +437,94 @@ bool InMemoryCoordinator::job_exists(
     );
 }
 
+void InMemoryCoordinator::apply_dispatch_decision(
+    const scheduler::DispatchDecision& decision
+) {
+    auto* selected_worker =
+        find_worker(decision.worker_id);
+
+    if (selected_worker == nullptr) {
+        throw std::logic_error{
+            "Dispatch planner selected an unknown worker"
+        };
+    }
+
+    auto selected_job =
+        queue_.take(decision.job_id);
+
+    if (!selected_job.has_value()) {
+        throw std::logic_error{
+            "Dispatch planner selected an unknown job"
+        };
+    }
+
+    domain::Job rollback_job{
+        *selected_job
+    };
+
+    bool resources_reserved = false;
+
+    try {
+        selected_worker->reserve(
+            selected_job->requirements()
+        );
+
+        resources_reserved = true;
+
+        selected_job->transition_to(
+            domain::JobState::leased
+        );
+
+        active_jobs_.push_back(
+            ActiveJob{
+                std::move(*selected_job),
+                decision.worker_id
+            }
+        );
+    } catch (...) {
+        if (resources_reserved) {
+            try {
+                selected_worker->release(
+                    rollback_job.requirements()
+                );
+            } catch (...) {
+                // Preserve the original exception.
+            }
+        }
+
+        if (!queue_.contains(
+                rollback_job.id()
+            )) {
+            queue_.enqueue(
+                std::move(rollback_job)
+            );
+        }
+
+        throw;
+    }
+}
+
 void InMemoryCoordinator::finish_job(
     const domain::JobId& job_id,
     domain::JobState terminal_state
 ) {
-    const auto active_iterator = std::find_if(
-        active_jobs_.begin(),
-        active_jobs_.end(),
-        [&job_id](const ActiveJob& active_job) {
-            return active_job.job.id() == job_id;
-        }
-    );
+    const auto active_iterator =
+        std::find_if(
+            active_jobs_.begin(),
+            active_jobs_.end(),
+            [&job_id](
+                const ActiveJob& active_job
+            ) {
+                return
+                    active_job.job.id() ==
+                    job_id;
+            }
+        );
 
-    if (active_iterator == active_jobs_.end()) {
+    if (
+        active_iterator ==
+        active_jobs_.end()
+    ) {
         throw std::invalid_argument{
             "Cannot finish an unknown active job"
         };
@@ -458,9 +535,10 @@ void InMemoryCoordinator::finish_job(
         terminal_state
     );
 
-    auto* worker = find_worker(
-        active_iterator->worker_id
-    );
+    auto* worker =
+        find_worker(
+            active_iterator->worker_id
+        );
 
     if (worker == nullptr) {
         throw std::logic_error{

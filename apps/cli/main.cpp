@@ -20,6 +20,9 @@ namespace rpc = radahn::rpc::v1;
 constexpr std::uint64_t mebibyte =
     1024ULL * 1024ULL;
 
+constexpr std::uint64_t default_sleep_duration_ms =
+    10'000ULL;
+
 void print_usage() {
     std::cout
         << "Radahn distributed computing platform\n\n"
@@ -52,12 +55,14 @@ void print_usage() {
             };
         }
 
-        if (value <
+        if (
+            value <
                 std::numeric_limits<int>::min() ||
             value >
-                std::numeric_limits<int>::max()) {
+                std::numeric_limits<int>::max()
+        ) {
             throw std::out_of_range{
-                "Integer is outside supported range"
+                "Integer is outside the supported range"
             };
         }
 
@@ -101,7 +106,10 @@ void print_usage() {
     std::string_view text,
     std::string_view field_name
 ) {
-    if (text.empty() || text.front() == '-') {
+    if (
+        text.empty() ||
+        text.front() == '-'
+    ) {
         throw std::invalid_argument{
             std::string{field_name} +
             " must be a nonnegative integer"
@@ -123,16 +131,20 @@ void print_usage() {
             };
         }
 
-        if (value >
-            std::numeric_limits<std::uint64_t>::max() /
-                mebibyte) {
+        if (
+            value >
+            std::numeric_limits<
+                std::uint64_t
+            >::max() / mebibyte
+        ) {
             throw std::out_of_range{
                 "MiB value is too large"
             };
         }
 
-        return static_cast<std::uint64_t>(value) *
-               mebibyte;
+        return
+            static_cast<std::uint64_t>(value) *
+            mebibyte;
     } catch (const std::exception&) {
         throw std::invalid_argument{
             std::string{field_name} +
@@ -175,22 +187,49 @@ void print_usage() {
     }
 }
 
-void print_job(const rpc::JobInfo& job) {
+[[nodiscard]] std::string_view workload_name(
+    rpc::WorkloadKind kind
+) noexcept {
+    switch (kind) {
+        case rpc::WORKLOAD_KIND_SLEEP:
+            return "SLEEP";
+
+        case rpc::WORKLOAD_KIND_UNSPECIFIED:
+        default:
+            return "UNSPECIFIED";
+    }
+}
+
+void print_job(
+    const rpc::JobInfo& job
+) {
     std::cout
-        << "Job: " << job.id() << '\n'
-        << "  Name: " << job.name() << '\n'
-        << "  State: " << state_name(job.state()) << '\n'
-        << "  Priority: " << job.priority() << '\n'
+        << "Job: "
+        << job.id()
+        << '\n'
+        << "  Name: "
+        << job.name()
+        << '\n'
+        << "  State: "
+        << state_name(job.state())
+        << '\n'
+        << "  Priority: "
+        << job.priority()
+        << '\n'
         << "  CPU cores: "
         << job.requirements().cpu_cores()
         << '\n'
         << "  Memory: "
-        << job.requirements().memory_bytes() /
-               mebibyte
+        << (
+            job.requirements().memory_bytes() /
+            mebibyte
+        )
         << " MiB\n"
         << "  Disk: "
-        << job.requirements().disk_bytes() /
-               mebibyte
+        << (
+            job.requirements().disk_bytes() /
+            mebibyte
+        )
         << " MiB\n"
         << "  GPU required: "
         << (
@@ -201,28 +240,64 @@ void print_job(const rpc::JobInfo& job) {
         << '\n'
         << "  Tags:";
 
-    if (job.requirements().required_tags().empty()) {
+    if (
+        job.requirements()
+            .required_tags()
+            .empty()
+    ) {
         std::cout << " none\n";
-        return;
+    } else {
+        for (
+            const auto& tag :
+            job.requirements().required_tags()
+        ) {
+            std::cout
+                << ' '
+                << tag;
+        }
+
+        std::cout << '\n';
     }
 
-    for (const auto& tag :
-         job.requirements().required_tags()) {
-        std::cout << ' ' << tag;
-    }
+    if (job.has_workload()) {
+        std::cout
+            << "  Workload: "
+            << workload_name(
+                job.workload().kind()
+            );
 
-    std::cout << '\n';
+        if (
+            job.workload().kind() ==
+            rpc::WORKLOAD_KIND_SLEEP
+        ) {
+            std::cout
+                << " for "
+                << job.workload()
+                       .sleep_duration_ms()
+                << " ms";
+        }
+
+        std::cout << '\n';
+    } else {
+        std::cout
+            << "  Workload: none\n";
+    }
 }
 
 [[nodiscard]]
-std::unique_ptr<rpc::ClientService::Stub>
+std::unique_ptr<
+    rpc::ClientService::Stub
+>
 make_stub() {
-    const auto channel = grpc::CreateChannel(
-        "localhost:50051",
-        grpc::InsecureChannelCredentials()
-    );
+    const auto channel =
+        grpc::CreateChannel(
+            "localhost:50051",
+            grpc::InsecureChannelCredentials()
+        );
 
-    return rpc::ClientService::NewStub(channel);
+    return rpc::ClientService::NewStub(
+        channel
+    );
 }
 
 int run_ping(
@@ -230,20 +305,29 @@ int run_ping(
     std::string message
 ) {
     rpc::PingRequest request;
-    request.set_message(std::move(message));
+
+    request.set_message(
+        std::move(message)
+    );
 
     rpc::PingResponse response;
     grpc::ClientContext context;
 
-    const grpc::Status status = stub.Ping(
-        &context,
-        request,
-        &response
-    );
+    const grpc::Status status =
+        stub.Ping(
+            &context,
+            request,
+            &response
+        );
 
     if (!status.ok()) {
         std::cerr
-            << "Ping failed: "
+            << "Ping failed"
+            << " (gRPC code "
+            << static_cast<int>(
+                status.error_code()
+            )
+            << "): "
             << status.error_message()
             << '\n';
 
@@ -270,22 +354,30 @@ int run_submit_job(
             << "Not enough arguments for job submission\n";
 
         print_usage();
+
         return 1;
     }
 
     try {
-        const std::string id{argv[3]};
-        const std::string name{argv[4]};
+        const std::string id{
+            argv[3]
+        };
 
-        const int priority = parse_int(
-            argv[5],
-            "priority"
-        );
+        const std::string name{
+            argv[4]
+        };
 
-        const double cpu_cores = parse_double(
-            argv[6],
-            "cpu"
-        );
+        const int priority =
+            parse_int(
+                argv[5],
+                "priority"
+            );
+
+        const double cpu_cores =
+            parse_double(
+                argv[6],
+                "cpu"
+            );
 
         const std::uint64_t memory_bytes =
             parse_mib(
@@ -300,11 +392,14 @@ int run_submit_job(
             );
 
         bool requires_gpu = false;
+
         std::vector<std::string> tags;
 
-        for (int index = 9;
-             index < argc;
-             ++index) {
+        for (
+            int index = 9;
+            index < argc;
+            ++index
+        ) {
             const std::string_view argument{
                 argv[index]
             };
@@ -321,7 +416,10 @@ int run_submit_job(
                     };
                 }
 
-                tags.emplace_back(argv[++index]);
+                tags.emplace_back(
+                    argv[++index]
+                );
+
                 continue;
             }
 
@@ -337,35 +435,70 @@ int run_submit_job(
         request.set_name(name);
 
         request.set_priority(
-            static_cast<std::int32_t>(priority)
+            static_cast<std::int32_t>(
+                priority
+            )
         );
 
         auto* requirements =
             request.mutable_requirements();
 
-        requirements->set_cpu_cores(cpu_cores);
-        requirements->set_memory_bytes(memory_bytes);
-        requirements->set_disk_bytes(disk_bytes);
-        requirements->set_requires_gpu(requires_gpu);
+        requirements->set_cpu_cores(
+            cpu_cores
+        );
+
+        requirements->set_memory_bytes(
+            memory_bytes
+        );
+
+        requirements->set_disk_bytes(
+            disk_bytes
+        );
+
+        requirements->set_requires_gpu(
+            requires_gpu
+        );
 
         for (const auto& tag : tags) {
-            requirements->add_required_tags(tag);
+            requirements->add_required_tags(
+                tag
+            );
         }
+
+        /*
+         * Milestone 2E uses a built-in sleep workload.
+         *
+         * Every job submitted by this CLI currently sleeps
+         * for 10 seconds after a worker starts it.
+         */
+        auto* workload =
+            request.mutable_workload();
+
+        workload->set_kind(
+            rpc::WORKLOAD_KIND_SLEEP
+        );
+
+        workload->set_sleep_duration_ms(
+            default_sleep_duration_ms
+        );
 
         rpc::SubmitJobResponse response;
         grpc::ClientContext context;
 
-        const grpc::Status status = stub.SubmitJob(
-            &context,
-            request,
-            &response
-        );
+        const grpc::Status status =
+            stub.SubmitJob(
+                &context,
+                request,
+                &response
+            );
 
         if (!status.ok()) {
             std::cerr
-                << "Job submission failed: "
+                << "Job submission failed"
                 << " (gRPC code "
-                << static_cast<int>(status.error_code())
+                << static_cast<int>(
+                    status.error_code()
+                )
                 << "): "
                 << status.error_message()
                 << '\n';
@@ -373,8 +506,12 @@ int run_submit_job(
             return 1;
         }
 
-        std::cout << "Job submitted successfully\n";
-        print_job(response.job());
+        std::cout
+            << "Job submitted successfully\n";
+
+        print_job(
+            response.job()
+        );
 
         return 0;
     } catch (const std::exception& error) {
@@ -392,27 +529,39 @@ int run_get_job(
     std::string id
 ) {
     rpc::GetJobRequest request;
-    request.set_id(std::move(id));
+
+    request.set_id(
+        std::move(id)
+    );
 
     rpc::GetJobResponse response;
     grpc::ClientContext context;
 
-    const grpc::Status status = stub.GetJob(
-        &context,
-        request,
-        &response
-    );
+    const grpc::Status status =
+        stub.GetJob(
+            &context,
+            request,
+            &response
+        );
 
     if (!status.ok()) {
         std::cerr
-            << "Get job failed: "
+            << "Get job failed"
+            << " (gRPC code "
+            << static_cast<int>(
+                status.error_code()
+            )
+            << "): "
             << status.error_message()
             << '\n';
 
         return 1;
     }
 
-    print_job(response.job());
+    print_job(
+        response.job()
+    );
+
     return 0;
 }
 
@@ -423,15 +572,21 @@ int run_list_jobs(
     rpc::ListJobsResponse response;
     grpc::ClientContext context;
 
-    const grpc::Status status = stub.ListJobs(
-        &context,
-        request,
-        &response
-    );
+    const grpc::Status status =
+        stub.ListJobs(
+            &context,
+            request,
+            &response
+        );
 
     if (!status.ok()) {
         std::cerr
-            << "List jobs failed: "
+            << "List jobs failed"
+            << " (gRPC code "
+            << static_cast<int>(
+                status.error_code()
+            )
+            << "): "
             << status.error_message()
             << '\n';
 
@@ -439,20 +594,47 @@ int run_list_jobs(
     }
 
     if (response.jobs().empty()) {
-        std::cout << "No jobs found\n";
+        std::cout
+            << "No jobs found\n";
+
         return 0;
     }
 
-    for (const auto& job : response.jobs()) {
+    for (
+        const auto& job :
+        response.jobs()
+    ) {
         std::cout
             << job.id()
             << " | "
-            << state_name(job.state())
+            << state_name(
+                job.state()
+            )
             << " | priority "
             << job.priority()
             << " | "
-            << job.name()
-            << '\n';
+            << job.name();
+
+        if (job.has_workload()) {
+            std::cout
+                << " | "
+                << workload_name(
+                    job.workload().kind()
+                );
+
+            if (
+                job.workload().kind() ==
+                rpc::WORKLOAD_KIND_SLEEP
+            ) {
+                std::cout
+                    << ' '
+                    << job.workload()
+                           .sleep_duration_ms()
+                    << " ms";
+            }
+        }
+
+        std::cout << '\n';
     }
 
     return 0;
@@ -460,13 +642,18 @@ int run_list_jobs(
 
 }  // namespace
 
-int main(int argc, char* argv[]) {
+int main(
+    int argc,
+    char* argv[]
+) {
     if (argc < 2) {
         print_usage();
         return 0;
     }
 
-    const std::string_view command{argv[1]};
+    const std::string_view command{
+        argv[1]
+    };
 
     if (command == "version") {
         std::cout
@@ -485,7 +672,9 @@ int main(int argc, char* argv[]) {
     auto stub = make_stub();
 
     if (command == "ping") {
-        std::string message{"hello"};
+        std::string message{
+            "hello"
+        };
 
         if (argc >= 3) {
             message = argv[2];
@@ -537,14 +726,27 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
 
-            return run_list_jobs(*stub);
+            return run_list_jobs(
+                *stub
+            );
         }
+
+        std::cerr
+            << "Unknown job command: "
+            << job_command
+            << '\n';
+
+        print_usage();
+
+        return 1;
     }
 
     std::cerr
-        << "Unknown command\n";
+        << "Unknown command: "
+        << command
+        << '\n';
 
     print_usage();
+
     return 1;
 }
-

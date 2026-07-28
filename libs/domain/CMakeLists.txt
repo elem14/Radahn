@@ -10,6 +10,7 @@ target_sources(
         src/worker_eligibility.cpp
         src/job.cpp
         src/worker_record.cpp
+        src/workload.cpp
 )
 
 target_include_directories(

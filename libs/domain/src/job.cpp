@@ -1,5 +1,6 @@
 #include "radahn/domain/job.hpp"
 
+#include <chrono>
 #include <stdexcept>
 #include <utility>
 
@@ -12,10 +13,31 @@ Job::Job(
     ResourceRequirements requirements,
     TimePoint created_at
 )
+    : Job{
+          std::move(id),
+          std::move(name),
+          priority,
+          std::move(requirements),
+          WorkloadSpec::sleep(
+              std::chrono::seconds{1}
+          ),
+          created_at
+      } {
+}
+
+Job::Job(
+    JobId id,
+    std::string name,
+    int priority,
+    ResourceRequirements requirements,
+    WorkloadSpec workload,
+    TimePoint created_at
+)
     : id_{std::move(id)},
       name_{std::move(name)},
       priority_{priority},
       requirements_{std::move(requirements)},
+      workload_{std::move(workload)},
       created_at_{created_at} {
     if (name_.empty()) {
         throw std::invalid_argument{
@@ -41,6 +63,11 @@ Job::requirements() const noexcept {
     return requirements_;
 }
 
+const WorkloadSpec&
+Job::workload() const noexcept {
+    return workload_;
+}
+
 JobState Job::state() const noexcept {
     return state_;
 }
@@ -49,7 +76,9 @@ Job::TimePoint Job::created_at() const noexcept {
     return created_at_;
 }
 
-void Job::transition_to(JobState next_state) {
+void Job::transition_to(
+    JobState next_state
+) {
     JobStateMachine::validate_transition(
         state_,
         next_state

@@ -2,6 +2,7 @@
 #include <chrono>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -186,6 +187,123 @@ grpc::Status acquire_job(
     );
 }
 
+grpc::Status start_job(
+    rpc::WorkerService::Stub& stub,
+    const std::string& worker_id,
+    const std::string& job_id,
+    rpc::StartJobResponse* response
+) {
+    rpc::StartJobRequest request;
+
+    request.set_worker_id(worker_id);
+    request.set_job_id(job_id);
+
+    grpc::ClientContext context;
+
+    context.set_deadline(
+        std::chrono::system_clock::now() +
+        std::chrono::seconds{5}
+    );
+
+    return stub.StartJob(
+        &context,
+        request,
+        response
+    );
+}
+
+grpc::Status finish_job(
+    rpc::WorkerService::Stub& stub,
+    const std::string& worker_id,
+    const std::string& job_id,
+    rpc::JobOutcome outcome,
+    rpc::FinishJobResponse* response
+) {
+    rpc::FinishJobRequest request;
+
+    request.set_worker_id(worker_id);
+    request.set_job_id(job_id);
+    request.set_outcome(outcome);
+
+    grpc::ClientContext context;
+
+    context.set_deadline(
+        std::chrono::system_clock::now() +
+        std::chrono::seconds{5}
+    );
+
+    return stub.FinishJob(
+        &context,
+        request,
+        response
+    );
+}
+
+[[nodiscard]]
+bool execute_job(
+    const rpc::JobInfo& job
+) {
+    if (!job.has_workload()) {
+        std::cerr
+            << "Job does not contain a workload\n";
+
+        return false;
+    }
+
+    switch (job.workload().kind()) {
+        case rpc::WORKLOAD_KIND_SLEEP: {
+            const std::uint64_t duration_ms =
+                job.workload().sleep_duration_ms();
+
+            if (duration_ms == 0) {
+                std::cerr
+                    << "Sleep duration must be positive\n";
+
+                return false;
+            }
+
+            using MillisecondsRep =
+                std::chrono::milliseconds::rep;
+
+            const auto maximum_duration =
+                static_cast<std::uint64_t>(
+                    std::numeric_limits<
+                        MillisecondsRep
+                    >::max()
+                );
+
+            if (duration_ms > maximum_duration) {
+                std::cerr
+                    << "Sleep duration is too large\n";
+
+                return false;
+            }
+
+            std::cout
+                << "Executing sleep workload for "
+                << duration_ms
+                << " ms\n";
+
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds{
+                    static_cast<MillisecondsRep>(
+                        duration_ms
+                    )
+                }
+            );
+
+            return true;
+        }
+
+        case rpc::WORKLOAD_KIND_UNSPECIFIED:
+        default:
+            std::cerr
+                << "Unsupported workload type\n";
+
+            return false;
+    }
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -271,9 +389,76 @@ int main(int argc, char* argv[]) {
         }
 
         if (response.has_job()) {
-            print_job(response.job());
-            break;
+        print_job(response.job());
+
+        rpc::StartJobResponse start_response;
+
+        const grpc::Status start_status =
+            start_job(
+                *stub,
+                worker_id,
+                response.job().id(),
+                &start_response
+            );
+
+        if (!start_status.ok()) {
+            std::cerr
+                << "Could not start job"
+                << " (gRPC code "
+                << static_cast<int>(
+                    start_status.error_code()
+                )
+                << "): "
+                << start_status.error_message()
+                << '\n';
+
+            return 1;
         }
+
+        std::cout
+            << "Job entered RUNNING state\n";
+
+        const bool succeeded =
+            execute_job(response.job());
+
+        rpc::FinishJobResponse finish_response;
+
+        const grpc::Status finish_status =
+            finish_job(
+                *stub,
+                worker_id,
+                response.job().id(),
+                succeeded
+                    ? rpc::JOB_OUTCOME_SUCCEEDED
+                    : rpc::JOB_OUTCOME_FAILED,
+                &finish_response
+            );
+
+        if (!finish_status.ok()) {
+            std::cerr
+                << "Could not finish job"
+                << " (gRPC code "
+                << static_cast<int>(
+                    finish_status.error_code()
+                )
+                << "): "
+                << finish_status.error_message()
+                << '\n';
+
+            return 1;
+        }
+
+        std::cout
+            << "Job completed with state "
+            << (
+                succeeded
+                    ? "SUCCEEDED"
+                    : "FAILED"
+            )
+            << '\n';
+
+        break;
+    }
 
         std::cout
             << "No eligible job available; retrying...\n";

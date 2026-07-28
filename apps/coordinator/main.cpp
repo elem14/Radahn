@@ -1,6 +1,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -25,6 +26,7 @@
 #include "radahn/domain/version.hpp"
 #include "radahn/domain/worker.hpp"
 #include "radahn/domain/worker_record.hpp"
+#include "radahn/domain/workload.hpp"
 #include "radahn/scheduler/least_loaded_policy.hpp"
 
 namespace {
@@ -32,6 +34,10 @@ namespace {
 namespace domain = radahn::domain;
 namespace rpc = radahn::rpc::v1;
 
+/*
+ * Convert the internal Radahn job state into the
+ * corresponding Protocol Buffer job state.
+ */
 [[nodiscard]] rpc::JobState to_rpc_job_state(
     domain::JobState state
 ) noexcept {
@@ -64,12 +70,50 @@ namespace rpc = radahn::rpc::v1;
     return rpc::JOB_STATE_UNSPECIFIED;
 }
 
+/*
+ * Convert an internal workload into its RPC representation.
+ */
+void fill_workload_info(
+    const domain::WorkloadSpec& workload,
+    rpc::WorkloadSpec* output
+) {
+    switch (workload.kind()) {
+        case domain::WorkloadKind::sleep:
+            output->set_kind(
+                rpc::WORKLOAD_KIND_SLEEP
+            );
+
+            output->set_sleep_duration_ms(
+                static_cast<std::uint64_t>(
+                    workload.sleep_duration().count()
+                )
+            );
+
+            return;
+    }
+
+    output->set_kind(
+        rpc::WORKLOAD_KIND_UNSPECIFIED
+    );
+}
+
+/*
+ * Fill a protobuf JobInfo message from a domain Job.
+ *
+ * This helper is reused by SubmitJob, GetJob, ListJobs,
+ * AcquireJob, StartJob, and FinishJob.
+ */
 void fill_job_info(
     const domain::Job& job,
     rpc::JobInfo* output
 ) {
-    output->set_id(job.id().value());
-    output->set_name(job.name());
+    output->set_id(
+        job.id().value()
+    );
+
+    output->set_name(
+        job.name()
+    );
 
     output->set_priority(
         static_cast<std::int32_t>(
@@ -78,7 +122,9 @@ void fill_job_info(
     );
 
     output->set_state(
-        to_rpc_job_state(job.state())
+        to_rpc_job_state(
+            job.state()
+        )
     );
 
     auto* requirements =
@@ -100,6 +146,8 @@ void fill_job_info(
         job.requirements().requires_gpu()
     );
 
+    requirements->clear_required_tags();
+
     for (const auto& tag :
          job.requirements().required_tags()) {
         requirements->add_required_tags(tag);
@@ -117,8 +165,17 @@ void fill_job_info(
             unix_milliseconds
         )
     );
+
+    fill_workload_info(
+        job.workload(),
+        output->mutable_workload()
+    );
 }
 
+/*
+ * Copy required resource tags from an RPC request
+ * into a standard C++ vector.
+ */
 [[nodiscard]] std::vector<std::string>
 copy_required_tags(
     const rpc::ResourceRequirements& requirements
@@ -139,6 +196,59 @@ copy_required_tags(
     return tags;
 }
 
+/*
+ * Convert an RPC workload into a validated domain workload.
+ */
+[[nodiscard]] domain::WorkloadSpec copy_workload(
+    const rpc::WorkloadSpec& workload
+) {
+    switch (workload.kind()) {
+        case rpc::WORKLOAD_KIND_SLEEP: {
+            const std::uint64_t duration_ms =
+                workload.sleep_duration_ms();
+
+            if (duration_ms == 0) {
+                throw std::invalid_argument{
+                    "Sleep duration must be positive"
+                };
+            }
+
+            using MillisecondsRep =
+                std::chrono::milliseconds::rep;
+
+            const auto maximum_duration =
+                static_cast<std::uint64_t>(
+                    std::numeric_limits<
+                        MillisecondsRep
+                    >::max()
+                );
+
+            if (duration_ms > maximum_duration) {
+                throw std::invalid_argument{
+                    "Sleep duration is outside the supported range"
+                };
+            }
+
+            return domain::WorkloadSpec::sleep(
+                std::chrono::milliseconds{
+                    static_cast<MillisecondsRep>(
+                        duration_ms
+                    )
+                }
+            );
+        }
+
+        case rpc::WORKLOAD_KIND_UNSPECIFIED:
+        default:
+            throw std::invalid_argument{
+                "Unsupported or missing workload"
+            };
+    }
+}
+
+/*
+ * Copy worker tags from a registration request.
+ */
 [[nodiscard]] std::vector<std::string>
 copy_worker_tags(
     const rpc::RegisterWorkerRequest& request
@@ -158,6 +268,9 @@ copy_worker_tags(
     return tags;
 }
 
+/*
+ * Safely convert a protobuf uint64 into size_t.
+ */
 [[nodiscard]] std::size_t checked_size_t(
     std::uint64_t value,
     std::string_view field_name
@@ -177,6 +290,21 @@ copy_worker_tags(
     return static_cast<std::size_t>(value);
 }
 
+/*
+ * One object implements both network-facing services:
+ *
+ * ClientService:
+ *   - Ping
+ *   - SubmitJob
+ *   - GetJob
+ *   - ListJobs
+ *
+ * WorkerService:
+ *   - RegisterWorker
+ *   - AcquireJob
+ *   - StartJob
+ *   - FinishJob
+ */
 class CoordinatorServiceImpl final
     : public rpc::ClientService::Service,
       public rpc::WorkerService::Service {
@@ -218,6 +346,13 @@ public:
                 };
             }
 
+            if (!request->has_workload()) {
+                return grpc::Status{
+                    grpc::StatusCode::INVALID_ARGUMENT,
+                    "Job workload is required"
+                };
+            }
+
             const domain::JobId job_id{
                 request->id()
             };
@@ -232,13 +367,19 @@ public:
                 )
             };
 
+            domain::WorkloadSpec workload =
+                copy_workload(
+                    request->workload()
+                );
+
             domain::Job job{
                 job_id,
                 request->name(),
                 static_cast<int>(
                     request->priority()
                 ),
-                std::move(requirements)
+                std::move(requirements),
+                std::move(workload)
             };
 
             {
@@ -486,33 +627,32 @@ public:
                     );
 
                 if (!assigned_job.has_value()) {
-                    while (true) {
-                        const auto decision =
-                            coordinator_.dispatch_once();
-
-                        if (!decision.has_value()) {
-                            break;
-                        }
-
-                        if (
-                            decision->worker_id ==
-                            worker_id
-                        ) {
-                            break;
-                        }
-                    }
+                    static_cast<void>(
+                        coordinator_
+                            .dispatch_once_for_worker(
+                                worker_id
+                            )
+                    );
 
                     assigned_job =
-                        coordinator_.leased_job_for_worker(
-                            worker_id
-                        );
+                        coordinator_
+                            .leased_job_for_worker(
+                                worker_id
+                            );
                 }
             }
 
+            /*
+             * AcquireJobResponse contains only the JobInfo
+             * message. An empty response means no job.
+             *
+             * Protobuf automatically generates has_job()
+             * for the nested message field.
+             */
             if (!assigned_job.has_value()) {
                 return grpc::Status::OK;
             }
-            
+
             fill_job_info(
                 *assigned_job,
                 response->mutable_job()
@@ -532,14 +672,214 @@ public:
         }
     }
 
+    grpc::Status StartJob(
+        grpc::ServerContext* context,
+        const rpc::StartJobRequest* request,
+        rpc::StartJobResponse* response
+    ) override {
+        static_cast<void>(context);
+
+        try {
+            const domain::WorkerId worker_id{
+                request->worker_id()
+            };
+
+            const domain::JobId job_id{
+                request->job_id()
+            };
+
+            std::optional<domain::Job> job;
+
+            {
+                const std::lock_guard lock{mutex_};
+
+                if (
+                    !coordinator_
+                        .is_job_assigned_to_worker(
+                            job_id,
+                            worker_id
+                        )
+                ) {
+                    return grpc::Status{
+                        grpc::StatusCode::FAILED_PRECONDITION,
+                        "Job is not assigned to this worker"
+                    };
+                }
+
+                const auto state =
+                    coordinator_.job_state(
+                        job_id
+                    );
+
+                if (
+                    state.has_value() &&
+                    *state ==
+                        domain::JobState::leased
+                ) {
+                    coordinator_.mark_running(
+                        job_id
+                    );
+                } else if (
+                    !state.has_value() ||
+                    *state !=
+                        domain::JobState::running
+                ) {
+                    return grpc::Status{
+                        grpc::StatusCode::FAILED_PRECONDITION,
+                        "Job is not in a startable state"
+                    };
+                }
+
+                job = coordinator_.get_job(
+                    job_id
+                );
+            }
+
+            if (!job.has_value()) {
+                return grpc::Status{
+                    grpc::StatusCode::INTERNAL,
+                    "Job disappeared after being started"
+                };
+            }
+
+            fill_job_info(
+                *job,
+                response->mutable_job()
+            );
+
+            return grpc::Status::OK;
+        } catch (const std::invalid_argument& error) {
+            return grpc::Status{
+                grpc::StatusCode::INVALID_ARGUMENT,
+                error.what()
+            };
+        } catch (const std::exception& error) {
+            return grpc::Status{
+                grpc::StatusCode::INTERNAL,
+                error.what()
+            };
+        }
+    }
+
+    grpc::Status FinishJob(
+        grpc::ServerContext* context,
+        const rpc::FinishJobRequest* request,
+        rpc::FinishJobResponse* response
+    ) override {
+        static_cast<void>(context);
+
+        try {
+            const domain::WorkerId worker_id{
+                request->worker_id()
+            };
+
+            const domain::JobId job_id{
+                request->job_id()
+            };
+
+            std::optional<domain::Job> job;
+
+            {
+                const std::lock_guard lock{mutex_};
+
+                if (
+                    !coordinator_
+                        .is_job_assigned_to_worker(
+                            job_id,
+                            worker_id
+                        )
+                ) {
+                    return grpc::Status{
+                        grpc::StatusCode::FAILED_PRECONDITION,
+                        "Job is not assigned to this worker"
+                    };
+                }
+
+                const auto state =
+                    coordinator_.job_state(
+                        job_id
+                    );
+
+                if (
+                    !state.has_value() ||
+                    *state !=
+                        domain::JobState::running
+                ) {
+                    return grpc::Status{
+                        grpc::StatusCode::FAILED_PRECONDITION,
+                        "Job is not running"
+                    };
+                }
+
+                switch (request->outcome()) {
+                    case rpc::JOB_OUTCOME_SUCCEEDED:
+                        coordinator_.mark_succeeded(
+                            job_id
+                        );
+                        break;
+
+                    case rpc::JOB_OUTCOME_FAILED:
+                        coordinator_.mark_failed(
+                            job_id
+                        );
+                        break;
+
+                    case rpc::JOB_OUTCOME_UNSPECIFIED:
+                    default:
+                        return grpc::Status{
+                            grpc::StatusCode::INVALID_ARGUMENT,
+                            "A valid job outcome is required"
+                        };
+                }
+
+                job = coordinator_.get_job(
+                    job_id
+                );
+            }
+
+            if (!job.has_value()) {
+                return grpc::Status{
+                    grpc::StatusCode::INTERNAL,
+                    "Job disappeared after being finished"
+                };
+            }
+
+            fill_job_info(
+                *job,
+                response->mutable_job()
+            );
+
+            return grpc::Status::OK;
+        } catch (const std::invalid_argument& error) {
+            return grpc::Status{
+                grpc::StatusCode::INVALID_ARGUMENT,
+                error.what()
+            };
+        } catch (const std::exception& error) {
+            return grpc::Status{
+                grpc::StatusCode::INTERNAL,
+                error.what()
+            };
+        }
+    }
+
 private:
-    // The coordinator stores a reference to the policy,
-    // so the policy must be constructed first and destroyed last.
+    /*
+     * InMemoryCoordinator stores a reference to its policy.
+     *
+     * Therefore, policy_ must be declared before coordinator_
+     * so it is created first and destroyed last.
+     */
     radahn::scheduler::LeastLoadedPolicy policy_;
 
     radahn::coordinator::InMemoryCoordinator
         coordinator_;
 
+    /*
+     * The synchronous gRPC server may process RPC calls
+     * concurrently. The in-memory coordinator is not itself
+     * thread-safe, so every access is protected by this mutex.
+     */
     std::mutex mutex_;
 };
 
@@ -562,13 +902,17 @@ int main() {
     builder.RegisterService(
         static_cast<
             rpc::ClientService::Service*
-        >(&service)
+        >(
+            &service
+        )
     );
 
     builder.RegisterService(
         static_cast<
             rpc::WorkerService::Service*
-        >(&service)
+        >(
+            &service
+        )
     );
 
     std::unique_ptr<grpc::Server> server{

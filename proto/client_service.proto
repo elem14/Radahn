@@ -3,7 +3,8 @@ syntax = "proto3";
 package radahn.rpc.v1;
 
 service ClientService {
-  rpc Ping(PingRequest) returns (PingResponse);
+  rpc Ping(PingRequest)
+      returns (PingResponse);
 
   rpc SubmitJob(SubmitJobRequest)
       returns (SubmitJobResponse);
@@ -44,6 +45,16 @@ message ResourceRequirements {
   repeated string required_tags = 5;
 }
 
+enum WorkloadKind {
+  WORKLOAD_KIND_UNSPECIFIED = 0;
+  WORKLOAD_KIND_SLEEP = 1;
+}
+
+message WorkloadSpec {
+  WorkloadKind kind = 1;
+  uint64 sleep_duration_ms = 2;
+}
+
 message JobInfo {
   string id = 1;
   string name = 2;
@@ -51,6 +62,7 @@ message JobInfo {
   JobState state = 4;
   ResourceRequirements requirements = 5;
   int64 created_at_unix_ms = 6;
+  WorkloadSpec workload = 7;
 }
 
 message SubmitJobRequest {
@@ -58,6 +70,7 @@ message SubmitJobRequest {
   string name = 2;
   int32 priority = 3;
   ResourceRequirements requirements = 4;
+  WorkloadSpec workload = 5;
 }
 
 message SubmitJobResponse {
