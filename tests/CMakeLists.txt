@@ -148,3 +148,24 @@ add_test(
     NAME radahn.persistence
     COMMAND radahn-persistence-tests
 )
+
+add_executable(
+    radahn-coordinator-repository-tests
+    unit/coordinator_repository_tests.cpp
+)
+
+target_link_libraries(
+    radahn-coordinator-repository-tests
+    PRIVATE
+        radahn_coordinator
+        radahn_persistence
+        radahn_scheduler
+        radahn_domain
+        radahn_project_options
+        radahn_project_warnings
+)
+
+add_test(
+    NAME radahn.coordinator_repository
+    COMMAND radahn-coordinator-repository-tests
+)

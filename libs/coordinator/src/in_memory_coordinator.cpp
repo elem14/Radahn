@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <memory>
 #include <span>
 #include <stdexcept>
 #include <utility>
@@ -9,62 +10,127 @@
 
 #include "radahn/domain/job_state.hpp"
 
+#include "radahn/persistence/in_memory_job_repository.hpp"
+#include "radahn/persistence/in_memory_worker_repository.hpp"
+#include "radahn/persistence/job_record.hpp"
+
 namespace radahn::coordinator {
 
 InMemoryCoordinator::InMemoryCoordinator(
     scheduler::ISchedulingPolicy& policy
-) noexcept
-    : planner_{policy} {
+)
+    : owned_job_repository_{
+          std::make_unique<
+              persistence::InMemoryJobRepository
+          >()
+      },
+      owned_worker_repository_{
+          std::make_unique<
+              persistence::InMemoryWorkerRepository
+          >()
+      },
+      job_repository_{
+          *owned_job_repository_
+      },
+      worker_repository_{
+          *owned_worker_repository_
+      },
+      planner_{policy} {
+}
+
+InMemoryCoordinator::InMemoryCoordinator(
+    scheduler::ISchedulingPolicy& policy,
+    persistence::IJobRepository& job_repository,
+    persistence::IWorkerRepository& worker_repository
+)
+    : job_repository_{job_repository},
+      worker_repository_{worker_repository},
+      planner_{policy} {
 }
 
 void InMemoryCoordinator::submit_job(
     domain::Job job
 ) {
-    if (job_exists(job.id())) {
+    const domain::JobId job_id{
+        job.id()
+    };
+
+    if (job_exists(job_id)) {
         throw std::invalid_argument{
             "A job with this ID already exists"
         };
     }
 
-    queue_.enqueue(std::move(job));
+    persistence::JobRecord record{
+        job,
+        std::nullopt
+    };
+
+    job_repository_.insert(
+        std::move(record)
+    );
+
+    try {
+        queue_.enqueue(
+            std::move(job)
+        );
+    } catch (...) {
+        /*
+         * Keep repository and queue state consistent if queue
+         * insertion unexpectedly fails.
+         */
+        try {
+            job_repository_.erase(job_id);
+        } catch (...) {
+            // Preserve the original exception.
+        }
+
+        throw;
+    }
 }
 
 void InMemoryCoordinator::register_worker(
     domain::WorkerRecord worker
 ) {
-    if (find_worker(worker.id()) != nullptr) {
-        throw std::invalid_argument{
-            "A worker with this ID is already registered"
-        };
-    }
-
-    workers_.push_back(std::move(worker));
+    worker_repository_.insert(
+        std::move(worker)
+    );
 }
 
 std::optional<scheduler::DispatchDecision>
 InMemoryCoordinator::dispatch_once() {
+    const auto workers =
+        worker_repository_.list();
+
     std::vector<domain::WorkerSnapshot> snapshots;
 
-    snapshots.reserve(workers_.size());
+    snapshots.reserve(
+        workers.size()
+    );
 
-    for (const auto& worker : workers_) {
+    for (const auto& worker : workers) {
         snapshots.push_back(
             worker.snapshot()
         );
     }
 
-    const auto decision = planner_.plan(
-        queue_,
-        std::span<const domain::WorkerSnapshot>{
-            snapshots
-        }
-    );
+    const auto decision =
+        planner_.plan(
+            queue_,
+            std::span<
+                const domain::WorkerSnapshot
+            >{
+                snapshots
+            }
+        );
 
     if (!decision.has_value()) {
         return std::nullopt;
     }
 
-    apply_dispatch_decision(*decision);
+    apply_dispatch_decision(
+        *decision
+    );
 
     return decision;
 }
@@ -73,31 +139,41 @@ std::optional<scheduler::DispatchDecision>
 InMemoryCoordinator::dispatch_once_for_worker(
     const domain::WorkerId& worker_id
 ) {
-    const auto* worker = find_worker(worker_id);
+    const auto worker =
+        worker_repository_.get(
+            worker_id
+        );
 
-    if (worker == nullptr) {
+    if (!worker.has_value()) {
         throw std::invalid_argument{
             "Cannot dispatch to an unknown worker"
         };
     }
 
-    const std::array<domain::WorkerSnapshot, 1>
-        snapshots{
-            worker->snapshot()
-        };
+    const std::array<
+        domain::WorkerSnapshot,
+        1
+    > snapshots{
+        worker->snapshot()
+    };
 
-    const auto decision = planner_.plan(
-        queue_,
-        std::span<const domain::WorkerSnapshot>{
-            snapshots
-        }
-    );
+    const auto decision =
+        planner_.plan(
+            queue_,
+            std::span<
+                const domain::WorkerSnapshot
+            >{
+                snapshots
+            }
+        );
 
     if (!decision.has_value()) {
         return std::nullopt;
     }
 
-    apply_dispatch_decision(*decision);
+    apply_dispatch_decision(
+        *decision
+    );
 
     return decision;
 }
@@ -105,16 +181,31 @@ InMemoryCoordinator::dispatch_once_for_worker(
 void InMemoryCoordinator::mark_running(
     const domain::JobId& job_id
 ) {
-    auto* active_job = find_active_job(job_id);
+    auto record =
+        job_repository_.get(
+            job_id
+        );
 
-    if (active_job == nullptr) {
+    if (!record.has_value()) {
         throw std::invalid_argument{
-            "Cannot start an unknown active job"
+            "Cannot start an unknown job"
         };
     }
 
-    active_job->job.transition_to(
+    if (
+        !record->assigned_worker_id.has_value()
+    ) {
+        throw std::invalid_argument{
+            "Cannot start an unassigned job"
+        };
+    }
+
+    record->job.transition_to(
         domain::JobState::running
+    );
+
+    job_repository_.update(
+        std::move(*record)
     );
 }
 
@@ -137,124 +228,121 @@ void InMemoryCoordinator::mark_failed(
 }
 
 std::size_t
-InMemoryCoordinator::queued_job_count() const noexcept {
-    return queue_.size();
+InMemoryCoordinator::queued_job_count() const {
+    const auto records =
+        job_repository_.list();
+
+    return static_cast<std::size_t>(
+        std::count_if(
+            records.begin(),
+            records.end(),
+            [](
+                const persistence::JobRecord& record
+            ) {
+                return
+                    record.job.state() ==
+                    domain::JobState::queued;
+            }
+        )
+    );
 }
 
 std::size_t
-InMemoryCoordinator::active_job_count() const noexcept {
-    return active_jobs_.size();
+InMemoryCoordinator::active_job_count() const {
+    const auto records =
+        job_repository_.list();
+
+    return static_cast<std::size_t>(
+        std::count_if(
+            records.begin(),
+            records.end(),
+            [](
+                const persistence::JobRecord& record
+            ) {
+                return is_active_state(
+                    record.job.state()
+                );
+            }
+        )
+    );
 }
 
 std::size_t
-InMemoryCoordinator::finished_job_count() const noexcept {
-    return finished_jobs_.size();
+InMemoryCoordinator::finished_job_count() const {
+    const auto records =
+        job_repository_.list();
+
+    return static_cast<std::size_t>(
+        std::count_if(
+            records.begin(),
+            records.end(),
+            [](
+                const persistence::JobRecord& record
+            ) {
+                return is_finished_state(
+                    record.job.state()
+                );
+            }
+        )
+    );
 }
 
 std::optional<domain::JobState>
 InMemoryCoordinator::job_state(
     const domain::JobId& job_id
 ) const {
-    for (const auto* queued_job :
-         queue_.ordered_jobs()) {
-        if (queued_job->id() == job_id) {
-            return queued_job->state();
-        }
-    }
-
-    const auto* active_job =
-        find_active_job(job_id);
-
-    if (active_job != nullptr) {
-        return active_job->job.state();
-    }
-
-    const auto finished_iterator =
-        std::find_if(
-            finished_jobs_.begin(),
-            finished_jobs_.end(),
-            [&job_id](const domain::Job& job) {
-                return job.id() == job_id;
-            }
+    const auto record =
+        job_repository_.get(
+            job_id
         );
 
-    if (
-        finished_iterator !=
-        finished_jobs_.end()
-    ) {
-        return finished_iterator->state();
+    if (!record.has_value()) {
+        return std::nullopt;
     }
 
-    return std::nullopt;
+    return record->job.state();
 }
 
 std::optional<domain::Job>
 InMemoryCoordinator::get_job(
     const domain::JobId& job_id
 ) const {
-    for (const auto* queued_job :
-         queue_.ordered_jobs()) {
-        if (queued_job->id() == job_id) {
-            return *queued_job;
-        }
-    }
-
-    const auto* active_job =
-        find_active_job(job_id);
-
-    if (active_job != nullptr) {
-        return active_job->job;
-    }
-
-    const auto finished_iterator =
-        std::find_if(
-            finished_jobs_.begin(),
-            finished_jobs_.end(),
-            [&job_id](const domain::Job& job) {
-                return job.id() == job_id;
-            }
+    const auto record =
+        job_repository_.get(
+            job_id
         );
 
-    if (
-        finished_iterator !=
-        finished_jobs_.end()
-    ) {
-        return *finished_iterator;
+    if (!record.has_value()) {
+        return std::nullopt;
     }
 
-    return std::nullopt;
+    return record->job;
 }
 
 std::vector<domain::Job>
 InMemoryCoordinator::list_jobs() const {
+    const auto records =
+        job_repository_.list();
+
     std::vector<domain::Job> jobs;
 
     jobs.reserve(
-        queue_.size() +
-        active_jobs_.size() +
-        finished_jobs_.size()
+        records.size()
     );
 
-    for (const auto* queued_job :
-         queue_.ordered_jobs()) {
-        jobs.push_back(*queued_job);
-    }
-
-    for (const auto& active_job :
-         active_jobs_) {
-        jobs.push_back(active_job.job);
-    }
-
-    for (const auto& finished_job :
-         finished_jobs_) {
-        jobs.push_back(finished_job);
+    for (const auto& record : records) {
+        jobs.push_back(
+            record.job
+        );
     }
 
     std::sort(
         jobs.begin(),
         jobs.end(),
-        [](const domain::Job& left,
-           const domain::Job& right) {
+        [](
+            const domain::Job& left,
+            const domain::Job& right
+        ) {
             if (
                 left.created_at() !=
                 right.created_at()
@@ -277,180 +365,112 @@ std::optional<domain::Job>
 InMemoryCoordinator::leased_job_for_worker(
     const domain::WorkerId& worker_id
 ) const {
+    const auto records =
+        job_repository_.list();
+
     const auto iterator =
         std::find_if(
-            active_jobs_.begin(),
-            active_jobs_.end(),
+            records.begin(),
+            records.end(),
             [&worker_id](
-                const ActiveJob& active_job
+                const persistence::JobRecord& record
             ) {
                 return
-                    active_job.worker_id ==
+                    record.assigned_worker_id
+                        .has_value() &&
+                    *record.assigned_worker_id ==
                         worker_id &&
-                    active_job.job.state() ==
+                    record.job.state() ==
                         domain::JobState::leased;
             }
         );
 
-    if (iterator == active_jobs_.end()) {
+    if (iterator == records.end()) {
         return std::nullopt;
     }
 
     return iterator->job;
 }
 
-bool InMemoryCoordinator::is_job_assigned_to_worker(
+bool
+InMemoryCoordinator::is_job_assigned_to_worker(
     const domain::JobId& job_id,
     const domain::WorkerId& worker_id
 ) const {
-    const auto* active_job =
-        find_active_job(job_id);
+    const auto record =
+        job_repository_.get(
+            job_id
+        );
 
     return
-        active_job != nullptr &&
-        active_job->worker_id == worker_id;
+        record.has_value() &&
+        record->assigned_worker_id.has_value() &&
+        *record->assigned_worker_id ==
+            worker_id;
 }
 
 std::optional<domain::WorkerSnapshot>
 InMemoryCoordinator::worker_snapshot(
     const domain::WorkerId& worker_id
 ) const {
-    const auto* worker =
-        find_worker(worker_id);
+    const auto worker =
+        worker_repository_.get(
+            worker_id
+        );
 
-    if (worker == nullptr) {
+    if (!worker.has_value()) {
         return std::nullopt;
     }
 
     return worker->snapshot();
 }
 
-domain::WorkerRecord*
-InMemoryCoordinator::find_worker(
-    const domain::WorkerId& worker_id
-) {
-    const auto iterator =
-        std::find_if(
-            workers_.begin(),
-            workers_.end(),
-            [&worker_id](
-                const domain::WorkerRecord& worker
-            ) {
-                return worker.id() == worker_id;
-            }
-        );
-
-    if (iterator == workers_.end()) {
-        return nullptr;
-    }
-
-    return &*iterator;
+bool InMemoryCoordinator::is_active_state(
+    domain::JobState state
+) noexcept {
+    return
+        state == domain::JobState::leased ||
+        state == domain::JobState::running ||
+        state ==
+            domain::JobState::
+                cancellation_requested;
 }
 
-const domain::WorkerRecord*
-InMemoryCoordinator::find_worker(
-    const domain::WorkerId& worker_id
-) const {
-    const auto iterator =
-        std::find_if(
-            workers_.begin(),
-            workers_.end(),
-            [&worker_id](
-                const domain::WorkerRecord& worker
-            ) {
-                return worker.id() == worker_id;
-            }
-        );
-
-    if (iterator == workers_.end()) {
-        return nullptr;
-    }
-
-    return &*iterator;
-}
-
-InMemoryCoordinator::ActiveJob*
-InMemoryCoordinator::find_active_job(
-    const domain::JobId& job_id
-) {
-    const auto iterator =
-        std::find_if(
-            active_jobs_.begin(),
-            active_jobs_.end(),
-            [&job_id](
-                const ActiveJob& active_job
-            ) {
-                return
-                    active_job.job.id() ==
-                    job_id;
-            }
-        );
-
-    if (iterator == active_jobs_.end()) {
-        return nullptr;
-    }
-
-    return &*iterator;
-}
-
-const InMemoryCoordinator::ActiveJob*
-InMemoryCoordinator::find_active_job(
-    const domain::JobId& job_id
-) const {
-    const auto iterator =
-        std::find_if(
-            active_jobs_.begin(),
-            active_jobs_.end(),
-            [&job_id](
-                const ActiveJob& active_job
-            ) {
-                return
-                    active_job.job.id() ==
-                    job_id;
-            }
-        );
-
-    if (iterator == active_jobs_.end()) {
-        return nullptr;
-    }
-
-    return &*iterator;
+bool InMemoryCoordinator::is_finished_state(
+    domain::JobState state
+) noexcept {
+    return
+        state == domain::JobState::succeeded ||
+        state == domain::JobState::failed ||
+        state == domain::JobState::cancelled;
 }
 
 bool InMemoryCoordinator::job_exists(
     const domain::JobId& job_id
 ) const {
-    if (queue_.contains(job_id)) {
-        return true;
-    }
-
-    if (find_active_job(job_id) != nullptr) {
-        return true;
-    }
-
-    return std::any_of(
-        finished_jobs_.begin(),
-        finished_jobs_.end(),
-        [&job_id](const domain::Job& job) {
-            return job.id() == job_id;
-        }
+    return job_repository_.contains(
+        job_id
     );
 }
 
 void InMemoryCoordinator::apply_dispatch_decision(
     const scheduler::DispatchDecision& decision
 ) {
-    auto* selected_worker =
-        find_worker(decision.worker_id);
+    auto worker =
+        worker_repository_.get(
+            decision.worker_id
+        );
 
-    if (selected_worker == nullptr) {
+    if (!worker.has_value()) {
         throw std::logic_error{
             "Dispatch planner selected an unknown worker"
         };
     }
 
     auto selected_job =
-        queue_.take(decision.job_id);
+        queue_.take(
+            decision.job_id
+        );
 
     if (!selected_job.has_value()) {
         throw std::logic_error{
@@ -458,46 +478,96 @@ void InMemoryCoordinator::apply_dispatch_decision(
         };
     }
 
-    domain::Job rollback_job{
-        *selected_job
-    };
-
-    bool resources_reserved = false;
-
-    try {
-        selected_worker->reserve(
-            selected_job->requirements()
+    auto stored_record =
+        job_repository_.get(
+            decision.job_id
         );
 
-        resources_reserved = true;
+    if (!stored_record.has_value()) {
+        queue_.enqueue(
+            std::move(*selected_job)
+        );
+
+        throw std::logic_error{
+            "Queued job does not exist in repository"
+        };
+    }
+
+    const domain::WorkerRecord original_worker{
+        *worker
+    };
+
+    const persistence::JobRecord original_record{
+        *stored_record
+    };
+
+    bool worker_repository_updated = false;
+    bool job_repository_updated = false;
+
+    try {
+        worker->reserve(
+            selected_job->requirements()
+        );
 
         selected_job->transition_to(
             domain::JobState::leased
         );
 
-        active_jobs_.push_back(
-            ActiveJob{
-                std::move(*selected_job),
-                decision.worker_id
-            }
+        stored_record->job =
+            std::move(*selected_job);
+
+        stored_record->assigned_worker_id =
+            decision.worker_id;
+
+        worker_repository_.update(
+            std::move(*worker)
         );
+
+        worker_repository_updated = true;
+
+        job_repository_.update(
+            std::move(*stored_record)
+        );
+
+        job_repository_updated = true;
     } catch (...) {
-        if (resources_reserved) {
+        /*
+         * These compensating updates are sufficient for the
+         * in-memory implementation. SQLite will later use a real
+         * database transaction for this operation.
+         */
+        if (worker_repository_updated) {
             try {
-                selected_worker->release(
-                    rollback_job.requirements()
+                worker_repository_.update(
+                    original_worker
                 );
             } catch (...) {
                 // Preserve the original exception.
             }
         }
 
-        if (!queue_.contains(
-                rollback_job.id()
-            )) {
-            queue_.enqueue(
-                std::move(rollback_job)
-            );
+        if (job_repository_updated) {
+            try {
+                job_repository_.update(
+                    original_record
+                );
+            } catch (...) {
+                // Preserve the original exception.
+            }
+        }
+
+        if (
+            !queue_.contains(
+                original_record.job.id()
+            )
+        ) {
+            try {
+                queue_.enqueue(
+                    original_record.job
+                );
+            } catch (...) {
+                // Preserve the original exception.
+            }
         }
 
         throw;
@@ -508,57 +578,95 @@ void InMemoryCoordinator::finish_job(
     const domain::JobId& job_id,
     domain::JobState terminal_state
 ) {
-    const auto active_iterator =
-        std::find_if(
-            active_jobs_.begin(),
-            active_jobs_.end(),
-            [&job_id](
-                const ActiveJob& active_job
-            ) {
-                return
-                    active_job.job.id() ==
-                    job_id;
-            }
+    auto record =
+        job_repository_.get(
+            job_id
         );
 
+    if (!record.has_value()) {
+        throw std::invalid_argument{
+            "Cannot finish an unknown job"
+        };
+    }
+
     if (
-        active_iterator ==
-        active_jobs_.end()
+        !record->assigned_worker_id.has_value()
     ) {
         throw std::invalid_argument{
-            "Cannot finish an unknown active job"
+            "Cannot finish an unassigned job"
         };
     }
 
     domain::JobStateMachine::validate_transition(
-        active_iterator->job.state(),
+        record->job.state(),
         terminal_state
     );
 
-    auto* worker =
-        find_worker(
-            active_iterator->worker_id
+    auto worker =
+        worker_repository_.get(
+            *record->assigned_worker_id
         );
 
-    if (worker == nullptr) {
+    if (!worker.has_value()) {
         throw std::logic_error{
-            "Active job references an unknown worker"
+            "Assigned job references an unknown worker"
         };
     }
 
-    worker->release(
-        active_iterator->job.requirements()
-    );
+    const domain::WorkerRecord original_worker{
+        *worker
+    };
 
-    active_iterator->job.transition_to(
-        terminal_state
-    );
+    const persistence::JobRecord original_record{
+        *record
+    };
 
-    finished_jobs_.push_back(
-        std::move(active_iterator->job)
-    );
+    bool worker_repository_updated = false;
+    bool job_repository_updated = false;
 
-    active_jobs_.erase(active_iterator);
+    try {
+        worker->release(
+            record->job.requirements()
+        );
+
+        record->job.transition_to(
+            terminal_state
+        );
+
+        worker_repository_.update(
+            std::move(*worker)
+        );
+
+        worker_repository_updated = true;
+
+        job_repository_.update(
+            std::move(*record)
+        );
+
+        job_repository_updated = true;
+    } catch (...) {
+        if (worker_repository_updated) {
+            try {
+                worker_repository_.update(
+                    original_worker
+                );
+            } catch (...) {
+                // Preserve the original exception.
+            }
+        }
+
+        if (job_repository_updated) {
+            try {
+                job_repository_.update(
+                    original_record
+                );
+            } catch (...) {
+                // Preserve the original exception.
+            }
+        }
+
+        throw;
+    }
 }
 
 }  // namespace radahn::coordinator

@@ -19,6 +19,10 @@
 #include "worker_service.grpc.pb.h"
 
 #include "radahn/coordinator/in_memory_coordinator.hpp"
+
+#include "radahn/persistence/in_memory_job_repository.hpp"
+#include "radahn/persistence/in_memory_worker_repository.hpp"
+
 #include "radahn/domain/id.hpp"
 #include "radahn/domain/job.hpp"
 #include "radahn/domain/job_state.hpp"
@@ -310,7 +314,11 @@ class CoordinatorServiceImpl final
       public rpc::WorkerService::Service {
 public:
     CoordinatorServiceImpl()
-        : coordinator_{policy_} {
+        : coordinator_{
+            policy_,
+            job_repository_,
+            worker_repository_
+        } {
     }
 
     grpc::Status Ping(
@@ -865,22 +873,28 @@ public:
 
 private:
     /*
-     * InMemoryCoordinator stores a reference to its policy.
+     * Member order matters:
      *
-     * Therefore, policy_ must be declared before coordinator_
-     * so it is created first and destroyed last.
+     * 1. policy_
+     * 2. repositories
+     * 3. coordinator_
+     *
+     * The coordinator stores references to all three objects.
      */
-    radahn::scheduler::LeastLoadedPolicy policy_;
+    radahn::scheduler::LeastLoadedPolicy
+        policy_;
+
+    radahn::persistence::InMemoryJobRepository
+        job_repository_;
+
+    radahn::persistence::InMemoryWorkerRepository
+        worker_repository_;
 
     radahn::coordinator::InMemoryCoordinator
         coordinator_;
 
-    /*
-     * The synchronous gRPC server may process RPC calls
-     * concurrently. The in-memory coordinator is not itself
-     * thread-safe, so every access is protected by this mutex.
-     */
     std::mutex mutex_;
+
 };
 
 }  // namespace

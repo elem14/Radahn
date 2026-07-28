@@ -1,8 +1,6 @@
-add_library(radahn_coordinator STATIC)
-
-target_sources(
+add_library(
     radahn_coordinator
-    PRIVATE
+    STATIC
         src/in_memory_coordinator.cpp
 )
 
@@ -15,8 +13,11 @@ target_include_directories(
 target_link_libraries(
     radahn_coordinator
     PUBLIC
-        radahn_scheduler
         radahn_domain
+        radahn_persistence
+        radahn_scheduler
+
+    PRIVATE
         radahn_project_options
         radahn_project_warnings
 )
