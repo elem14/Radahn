@@ -4,6 +4,7 @@
   "description": "Distributed experiment and batch-computing platform",
   "dependencies": [
     "grpc",
-    "protobuf"
+    "protobuf",
+    "sqlite3"
   ]
 }

@@ -169,3 +169,21 @@ add_test(
     NAME radahn.coordinator_repository
     COMMAND radahn-coordinator-repository-tests
 )
+
+add_executable(
+    radahn-sqlite-database-tests
+    unit/sqlite_database_tests.cpp
+)
+
+target_link_libraries(
+    radahn-sqlite-database-tests
+    PRIVATE
+        radahn_persistence
+        radahn_project_options
+        radahn_project_warnings
+)
+
+add_test(
+    NAME radahn.sqlite_database
+    COMMAND radahn-sqlite-database-tests
+)
