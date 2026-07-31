@@ -12,6 +12,7 @@ add_library(
         src/sqlite_database.cpp
         src/sqlite_schema.cpp
         src/sqlite_job_repository.cpp
+        src/sqlite_worker_repository.cpp
 )
 
 target_include_directories(

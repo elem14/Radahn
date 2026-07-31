@@ -206,3 +206,22 @@ add_test(
     NAME radahn.sqlite_job_repository
     COMMAND radahn-sqlite-job-repository-tests
 )
+
+add_executable(
+    radahn-sqlite-worker-repository-tests
+    unit/sqlite_worker_repository_tests.cpp
+)
+
+target_link_libraries(
+    radahn-sqlite-worker-repository-tests
+    PRIVATE
+        radahn_persistence
+        radahn_domain
+        radahn_project_options
+        radahn_project_warnings
+)
+
+add_test(
+    NAME radahn.sqlite_worker_repository
+    COMMAND radahn-sqlite-worker-repository-tests
+)
