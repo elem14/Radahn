@@ -22,6 +22,8 @@ WORKER_BINARY="${BUILD_DIRECTORY}/apps/worker/radahn-worker"
 
 TEMP_DIRECTORY="$(mktemp -d)"
 
+DATABASE_PATH="${TEMP_DIRECTORY}/radahn-smoke.db"
+
 COORDINATOR_LOG="${TEMP_DIRECTORY}/coordinator.log"
 SUBMIT_LOG="${TEMP_DIRECTORY}/submit.log"
 WORKER_LOG="${TEMP_DIRECTORY}/worker.log"
@@ -115,6 +117,7 @@ echo
 echo "[5/7] Starting coordinator"
 
 "${COORDINATOR_BINARY}" \
+    "${DATABASE_PATH}" \
     >"${COORDINATOR_LOG}" 2>&1 &
 
 COORDINATOR_PID=$!
@@ -223,6 +226,11 @@ if ! grep -q "Job completed with state SUCCEEDED" \
     "${WORKER_LOG}"
 then
     echo "Worker did not report successful completion."
+    exit 1
+fi
+
+if [[ ! -s "${DATABASE_PATH}" ]]; then
+    echo "Coordinator did not create a SQLite database file."
     exit 1
 fi
 

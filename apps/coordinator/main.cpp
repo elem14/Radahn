@@ -12,6 +12,7 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+#include <filesystem>
 
 #include <grpcpp/grpcpp.h>
 
@@ -20,8 +21,9 @@
 
 #include "radahn/coordinator/in_memory_coordinator.hpp"
 
-#include "radahn/persistence/in_memory_job_repository.hpp"
-#include "radahn/persistence/in_memory_worker_repository.hpp"
+#include "radahn/persistence/sqlite_database.hpp"
+#include "radahn/persistence/sqlite_job_repository.hpp"
+#include "radahn/persistence/sqlite_worker_repository.hpp"
 
 #include "radahn/domain/id.hpp"
 #include "radahn/domain/job.hpp"
@@ -40,7 +42,7 @@ namespace rpc = radahn::rpc::v1;
 
 /*
  * Convert the internal Radahn job state into the
- * corresponding Protocol Buffer job state.
+ * corresponding Protocol Buffer job state
  */
 [[nodiscard]] rpc::JobState to_rpc_job_state(
     domain::JobState state
@@ -75,7 +77,7 @@ namespace rpc = radahn::rpc::v1;
 }
 
 /*
- * Convert an internal workload into its RPC representation.
+ * Convert an internal workload into its RPC representation
  */
 void fill_workload_info(
     const domain::WorkloadSpec& workload,
@@ -102,7 +104,7 @@ void fill_workload_info(
 }
 
 /*
- * Fill a protobuf JobInfo message from a domain Job.
+ * Fill a protobuf JobInfo message from a domain Job
  *
  * This helper is reused by SubmitJob, GetJob, ListJobs,
  * AcquireJob, StartJob, and FinishJob.
@@ -178,7 +180,7 @@ void fill_job_info(
 
 /*
  * Copy required resource tags from an RPC request
- * into a standard C++ vector.
+ * into a standard vector
  */
 [[nodiscard]] std::vector<std::string>
 copy_required_tags(
@@ -201,7 +203,7 @@ copy_required_tags(
 }
 
 /*
- * Convert an RPC workload into a validated domain workload.
+ * Convert an RPC workload into a validated domain workload
  */
 [[nodiscard]] domain::WorkloadSpec copy_workload(
     const rpc::WorkloadSpec& workload
@@ -251,7 +253,7 @@ copy_required_tags(
 }
 
 /*
- * Copy worker tags from a registration request.
+ * Copy worker tags from a registration request
  */
 [[nodiscard]] std::vector<std::string>
 copy_worker_tags(
@@ -273,7 +275,7 @@ copy_worker_tags(
 }
 
 /*
- * Safely convert a protobuf uint64 into size_t.
+ * Safely convert a protobuf uint64 into size_t
  */
 [[nodiscard]] std::size_t checked_size_t(
     std::uint64_t value,
@@ -313,11 +315,16 @@ class CoordinatorServiceImpl final
     : public rpc::ClientService::Service,
       public rpc::WorkerService::Service {
 public:
-    CoordinatorServiceImpl()
-        : coordinator_{
-            policy_,
-            job_repository_,
-            worker_repository_
+    explicit CoordinatorServiceImpl(
+        const std::filesystem::path& database_path
+    )
+        : database_{database_path},
+          job_repository_{database_},
+          worker_repository_{database_},
+          coordinator_{
+              policy_,
+              job_repository_,
+              worker_repository_
         } {
     }
 
@@ -559,6 +566,10 @@ public:
                 max_concurrent_jobs,
                 copy_worker_tags(*request)
             };
+            
+            domain::WorkerRecord worker_record{
+                std::move(snapshot)
+            };
 
             bool already_registered = false;
 
@@ -566,15 +577,17 @@ public:
                 const std::lock_guard lock{mutex_};
 
                 already_registered =
-                    coordinator_.worker_snapshot(
+                    worker_repository_.contains(
                         worker_id
-                    ).has_value();
+                    );
 
-                if (!already_registered) {
+                if (already_registered) {
+                    worker_repository_.update(
+                        std::move(worker_record)
+                    );
+                } else {
                     coordinator_.register_worker(
-                        domain::WorkerRecord{
-                            std::move(snapshot)
-                        }
+                        std::move(worker_record)
                     );
                 }
             }
@@ -652,7 +665,7 @@ public:
 
             /*
              * AcquireJobResponse contains only the JobInfo
-             * message. An empty response means no job.
+             * message, empty response = no job
              *
              * Protobuf automatically generates has_job()
              * for the nested message field.
@@ -873,21 +886,24 @@ public:
 
 private:
     /*
-     * Member order matters:
+     * Member order matters
      *
      * 1. policy_
      * 2. repositories
      * 3. coordinator_
      *
-     * The coordinator stores references to all three objects.
+     * The coordinator stores references to all three
      */
     radahn::scheduler::LeastLoadedPolicy
         policy_;
 
-    radahn::persistence::InMemoryJobRepository
+    radahn::persistence::SqliteDatabase
+        database_;
+
+    radahn::persistence::SqliteJobRepository
         job_repository_;
 
-    radahn::persistence::InMemoryWorkerRepository
+    radahn::persistence::SqliteWorkerRepository
         worker_repository_;
 
     radahn::coordinator::InMemoryCoordinator
@@ -899,55 +915,95 @@ private:
 
 }  // namespace
 
-int main() {
-    const std::string server_address{
-        "0.0.0.0:50051"
-    };
-
-    CoordinatorServiceImpl service;
-
-    grpc::ServerBuilder builder;
-
-    builder.AddListeningPort(
-        server_address,
-        grpc::InsecureServerCredentials()
-    );
-
-    builder.RegisterService(
-        static_cast<
-            rpc::ClientService::Service*
-        >(
-            &service
-        )
-    );
-
-    builder.RegisterService(
-        static_cast<
-            rpc::WorkerService::Service*
-        >(
-            &service
-        )
-    );
-
-    std::unique_ptr<grpc::Server> server{
-        builder.BuildAndStart()
-    };
-
-    if (!server) {
+int main(
+    int argc,
+    char* argv[]
+) {
+    if (argc > 2) {
         std::cerr
-            << "Failed to start Radahn Coordinator\n";
+            << "Usage: radahn-coordinator"
+            << " [database-path]\n";
 
         return 1;
     }
 
-    std::cout
-        << "Radahn Coordinator "
-        << domain::version()
-        << " listening on "
-        << server_address
-        << '\n';
+    /*
+     * Running without an argument creates or opens ./radahn.db
+     * Tests can pass a temporary database path instead
+     */
+    std::filesystem::path database_path{
+        "radahn.db"
+    };
 
-    server->Wait();
+    if (argc == 2) {
+        database_path =
+            std::filesystem::path{
+                argv[1]
+            };
+    }
 
-    return 0;
+    const std::string server_address{
+        "0.0.0.0:50051"
+    };
+
+    try {
+        CoordinatorServiceImpl service{
+            database_path
+        };
+
+        grpc::ServerBuilder builder;
+
+        builder.AddListeningPort(
+            server_address,
+            grpc::InsecureServerCredentials()
+        );
+
+        builder.RegisterService(
+            static_cast<
+                rpc::ClientService::Service*
+            >(
+                &service
+            )
+        );
+
+        builder.RegisterService(
+            static_cast<
+                rpc::WorkerService::Service*
+            >(
+                &service
+            )
+        );
+
+        std::unique_ptr<grpc::Server> server{
+            builder.BuildAndStart()
+        };
+
+        if (!server) {
+            std::cerr
+                << "Failed to start Radahn Coordinator\n";
+
+            return 1;
+        }
+
+        std::cout
+            << "Radahn Coordinator "
+            << domain::version()
+            << " listening on "
+            << server_address
+            << '\n'
+            << "Database: "
+            << database_path.string()
+            << '\n';
+
+        server->Wait();
+
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr
+            << "Coordinator startup failed: "
+            << error.what()
+            << '\n';
+
+        return 1;
+    }
 }
