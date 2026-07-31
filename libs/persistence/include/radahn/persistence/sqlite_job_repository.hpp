@@ -5,14 +5,24 @@
 #include <vector>
 
 #include "radahn/domain/id.hpp"
+
 #include "radahn/persistence/job_record.hpp"
 #include "radahn/persistence/job_repository.hpp"
+#include "radahn/persistence/sqlite_database.hpp"
 
 namespace radahn::persistence {
 
-class InMemoryJobRepository final
+class SqliteJobRepository final
     : public IJobRepository {
 public:
+    /*
+     * database object must outlive this repository
+     * the constructor initializes the current schema if needed
+     */
+    explicit SqliteJobRepository(
+        SqliteDatabase& database
+    );
+
     void insert(
         JobRecord record
     ) override;
@@ -43,7 +53,7 @@ public:
     std::size_t size() const override;
 
 private:
-    std::vector<JobRecord> records_;
+    SqliteDatabase& database_;
 };
 
 }  // namespace radahn::persistence

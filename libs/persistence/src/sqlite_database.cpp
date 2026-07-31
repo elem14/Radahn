@@ -227,4 +227,9 @@ std::int64_t SqliteDatabase::query_int64(
     );
 }
 
+sqlite3*
+SqliteDatabase::native_handle() const noexcept {
+    return database_;
+}
+
 }  // namespace radahn::persistence

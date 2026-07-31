@@ -56,6 +56,10 @@ public:
         std::string_view sql
     ) const;
 
+    //low level connection access for persistence classes
+    [[nodiscard]]
+    sqlite3* native_handle() const noexcept;
+
 private:
     sqlite3* database_{nullptr};
 };

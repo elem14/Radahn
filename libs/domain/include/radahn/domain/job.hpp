@@ -15,11 +15,7 @@ public:
     using Clock = std::chrono::system_clock;
     using TimePoint = Clock::time_point;
 
-    // Original constructor.
-    //
-    // Existing code can continue creating a job without
-    // explicitly providing a workload. It receives a
-    // default one-second sleep workload.
+    // Original constructor
     Job(
         JobId id,
         std::string name,
@@ -28,7 +24,7 @@ public:
         TimePoint created_at = Clock::now()
     );
 
-    // New constructor that accepts an explicit workload.
+    // New constructor that accepts an explicit workload
     Job(
         JobId id,
         std::string name,
@@ -36,6 +32,18 @@ public:
         ResourceRequirements requirements,
         WorkloadSpec workload,
         TimePoint created_at = Clock::now()
+    );
+
+    // reconstruct previously saved job
+    [[nodiscard]]
+    static Job restore(
+        JobId id,
+        std::string name,
+        int priority,
+        ResourceRequirements requirements,
+        WorkloadSpec workload,
+        JobState state,
+        TimePoint created_at
     );
 
     [[nodiscard]]
@@ -64,6 +72,17 @@ public:
     void transition_to(JobState next_state);
 
 private:
+
+    Job(
+        JobId id,
+        std:: string name,
+        int priority,
+        ResourceRequirements requirements,
+        WorkloadSpec workload,
+        JobState state,
+        TimePoint created_at
+    );
+
     JobId id_;
     std::string name_;
     int priority_;

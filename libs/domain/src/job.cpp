@@ -21,6 +21,7 @@ Job::Job(
           WorkloadSpec::sleep(
               std::chrono::seconds{1}
           ),
+          JobState::queued,
           created_at
       } {
 }
@@ -33,11 +34,52 @@ Job::Job(
     WorkloadSpec workload,
     TimePoint created_at
 )
+    : Job{
+          std::move(id),
+          std::move(name),
+          priority,
+          std::move(requirements),
+          std::move(workload),
+          JobState::queued,
+          created_at
+      } {
+}
+
+Job Job::restore(
+    JobId id,
+    std::string name,
+    int priority,
+    ResourceRequirements requirements,
+    WorkloadSpec workload,
+    JobState state,
+    TimePoint created_at
+) {
+    return Job{
+        std::move(id),
+        std::move(name),
+        priority,
+        std::move(requirements),
+        std::move(workload),
+        state,
+        created_at
+    };
+}
+
+Job::Job(
+    JobId id,
+    std::string name,
+    int priority,
+    ResourceRequirements requirements,
+    WorkloadSpec workload,
+    JobState state,
+    TimePoint created_at
+)
     : id_{std::move(id)},
       name_{std::move(name)},
       priority_{priority},
       requirements_{std::move(requirements)},
       workload_{std::move(workload)},
+      state_{state},
       created_at_{created_at} {
     if (name_.empty()) {
         throw std::invalid_argument{

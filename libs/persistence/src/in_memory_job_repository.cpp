@@ -116,7 +116,7 @@ void InMemoryJobRepository::erase(
 }
 
 std::size_t
-InMemoryJobRepository::size() const noexcept {
+InMemoryJobRepository::size() const {
     return records_.size();
 }
 

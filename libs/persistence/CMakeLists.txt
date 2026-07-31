@@ -11,6 +11,7 @@ add_library(
         src/in_memory_worker_repository.cpp
         src/sqlite_database.cpp
         src/sqlite_schema.cpp
+        src/sqlite_job_repository.cpp
 )
 
 target_include_directories(

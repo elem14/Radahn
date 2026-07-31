@@ -40,7 +40,7 @@ public:
     ) override;
 
     [[nodiscard]]
-    std::size_t size() const noexcept override;
+    std::size_t size() const override;
 
 private:
     std::vector<domain::WorkerRecord>

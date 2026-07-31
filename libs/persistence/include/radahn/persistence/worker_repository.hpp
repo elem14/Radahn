@@ -52,7 +52,7 @@ public:
     ) = 0;
 
     [[nodiscard]]
-    virtual std::size_t size() const noexcept = 0;
+    virtual std::size_t size() const = 0;
 };
 
 }  // namespace radahn::persistence

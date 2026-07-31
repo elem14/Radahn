@@ -119,7 +119,7 @@ void InMemoryWorkerRepository::erase(
 }
 
 std::size_t
-InMemoryWorkerRepository::size() const noexcept {
+InMemoryWorkerRepository::size() const {
     return records_.size();
 }
 
