@@ -157,7 +157,8 @@ void insert_test_worker(
                 available_disk_bytes,
                 gpu_available,
                 running_jobs,
-                max_concurrent_jobs
+                max_concurrent_jobs,
+                last_heartbeat_unix_ms
             )
             VALUES (
                 'worker-1',
@@ -170,7 +171,8 @@ void insert_test_worker(
                 107374182400,
                 1,
                 0,
-                4
+                4,
+                1700000000123
             );
         )sql"
     );

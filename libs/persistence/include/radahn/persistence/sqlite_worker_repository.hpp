@@ -15,10 +15,6 @@ namespace radahn::persistence {
 class SqliteWorkerRepository final
     : public IWorkerRepository {
 public:
-    /*
-     *SqliteDatabase object needs to outlive this repository
-     *constructor ensures that the current schema exists
-     */
     explicit SqliteWorkerRepository(
         SqliteDatabase& database
     );
@@ -42,6 +38,17 @@ public:
 
     [[nodiscard]]
     bool contains(
+        const domain::WorkerId& worker_id
+    ) const override;
+
+    void record_heartbeat(
+        const domain::WorkerId& worker_id,
+        WorkerHeartbeatTimePoint heartbeat_time
+    ) override;
+
+    [[nodiscard]]
+    std::optional<WorkerHeartbeatTimePoint>
+    last_heartbeat(
         const domain::WorkerId& worker_id
     ) const override;
 

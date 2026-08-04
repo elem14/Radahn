@@ -66,8 +66,8 @@ void test_schema_creation() {
     expect(
         database.query_int64(
             "PRAGMA user_version;"
-        ) == 1,
-        "SQLite schema version is one"
+        ) == 2,
+        "SQLite schema version is two"
     );
 
     expect(
@@ -78,6 +78,15 @@ void test_schema_creation() {
             "AND name = 'workers';"
         ) == 1,
         "Workers table exists"
+    );
+
+    expect(
+        database.query_int64(
+            "SELECT COUNT(*) "
+            "FROM pragma_table_info('workers') "
+            "WHERE name = 'last_heartbeat_unix_ms';"
+        ) == 1,
+        "Workers table contains heartbeat timestamp"
     );
 
     expect(
@@ -129,6 +138,15 @@ void test_schema_creation() {
         "Schema migration version is recorded"
     );
 
+    expect(
+        database.query_int64(
+            "SELECT COUNT(*) "
+            "FROM schema_migrations "
+            "WHERE version = 2;"
+        ) == 1,
+        "Heartbeat schema migration is recorded"
+    );
+
     /*
      * initializer must be safe to call again
      */
@@ -140,7 +158,7 @@ void test_schema_creation() {
         database.query_int64(
             "SELECT COUNT(*) "
             "FROM schema_migrations "
-            "WHERE version = 1;"
+            "WHERE version = 2;"
         ) == 1,
         "Schema initialization is idempotent"
     );

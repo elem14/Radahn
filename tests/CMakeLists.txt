@@ -267,3 +267,22 @@ add_test(
     NAME radahn.sqlite_coordinator_recovery
     COMMAND radahn-sqlite-coordinator-recovery-tests
 )
+
+add_executable(
+    radahn-worker-heartbeat-repository-tests
+    unit/worker_heartbeat_repository_tests.cpp
+)
+
+target_link_libraries(
+    radahn-worker-heartbeat-repository-tests
+    PRIVATE
+        radahn_persistence
+        radahn_domain
+        radahn_project_options
+        radahn_project_warnings
+)
+
+add_test(
+    NAME radahn.worker_heartbeat_repository
+    COMMAND radahn-worker-heartbeat-repository-tests
+)

@@ -1,5 +1,6 @@
 #include "radahn/persistence/sqlite_worker_repository.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -281,6 +282,39 @@ std::size_t checked_size_column(
     return static_cast<std::size_t>(
         value
     );
+}
+
+[[nodiscard]]
+std::int64_t heartbeat_to_unix_ms(
+    WorkerHeartbeatTimePoint heartbeat_time
+) {
+    return 
+        std::chrono::duration_cast<
+            std::chrono::milliseconds
+        >(
+            heartbeat_time.time_since_epoch()
+        ).count();
+}
+
+[[nodiscard]]
+WorkerHeartbeatTimePoint heartbeat_from_unix_ms(
+    std::int64_t unix_ms
+) {
+    if (unix_ms < 0) {
+        throw std::runtime_error{
+            "Stored heartbeat timestamp is negative"
+        };
+    }
+
+    return WorkerHeartbeatTimePoint{
+        std::chrono::duration_cast<
+            WorkerHeartbeatClock::duration
+        >(
+            std::chrono::milliseconds{
+                unix_ms
+            }
+        )
+    };
 }
 
 [[nodiscard]]
@@ -651,11 +685,12 @@ void SqliteWorkerRepository::insert(
                         available_disk_bytes,
                         gpu_available,
                         running_jobs,
-                        max_concurrent_jobs
+                        max_concurrent_jobs,
+                        last_heartbeat_unix_ms
                     )
                     VALUES (
                         ?, ?, ?, ?, ?, ?,
-                        ?, ?, ?, ?, ?
+                        ?, ?, ?, ?, ?, ?
                     );
                 )sql"
             );
@@ -768,6 +803,16 @@ void SqliteWorkerRepository::insert(
                 "max_concurrent_jobs"
             ),
             "max_concurrent_jobs"
+        );
+
+        bind_int64(
+            database,
+            statement.get(),
+            12,
+            heartbeat_to_unix_ms(
+                WorkerHeartbeatClock::now()
+            ),
+            "last_heartbeat_unix_ms"
         );
 
         const int result =
@@ -1158,6 +1203,109 @@ bool SqliteWorkerRepository::contains(
     throw database_error(
         database,
         "Could not check whether worker exists"
+    );
+}
+
+void SqliteWorkerRepository::record_heartbeat(
+    const domain::WorkerId& worker_id,
+    WorkerHeartbeatTimePoint heartbeat_time
+) {
+    if (!contains(worker_id)) {
+        throw std::invalid_argument{
+            "Cannot record a heartbeat for an unknown worker"
+        };
+    }
+
+    sqlite3* database =
+        database_.native_handle();
+
+    auto statement =
+        prepare_statement(
+            database,
+            R"sql(
+                UPDATE workers
+                SET last_heartbeat_unix_ms = ?
+                WHERE worker_id = ?;
+            )sql"
+        );
+
+    bind_int64(
+        database,
+        statement.get(),
+        1,
+        heartbeat_to_unix_ms(
+            heartbeat_time
+        ),
+        "last_heartbeat_unix_ms"
+    );
+
+    bind_text(
+        database,
+        statement.get(),
+        2,
+        worker_id.value(),
+        "worker_id"
+    );
+
+    const int result =
+        sqlite3_step(
+            statement.get()
+        );
+
+    if (result != SQLITE_DONE) {
+        throw database_error(
+            database,
+            "Could not record worker heartbeat"
+        );
+    }
+}
+
+std::optional<WorkerHeartbeatTimePoint>
+SqliteWorkerRepository::last_heartbeat(
+    const domain::WorkerId& worker_id
+) const {
+    sqlite3* database =
+        database_.native_handle();
+
+    auto statement =
+        prepare_statement(
+            database,
+            R"sql(
+                SELECT last_heartbeat_unix_ms
+                FROM workers
+                WHERE worker_id = ?;
+            )sql"
+        );
+
+    bind_text(
+        database,
+        statement.get(),
+        1,
+        worker_id.value(),
+        "worker_id"
+    );
+
+    const int result =
+        sqlite3_step(
+            statement.get()
+        );
+
+    if (result == SQLITE_DONE) {
+        return std::nullopt;
+    }
+
+    if (result != SQLITE_ROW) {
+        throw database_error(
+            database,
+            "Could not retrieve worker heartbeat"
+        );
+    }
+
+    return heartbeat_from_unix_ms(
+        sqlite3_column_int64(
+            statement.get(),
+            0
+        )
     );
 }
 

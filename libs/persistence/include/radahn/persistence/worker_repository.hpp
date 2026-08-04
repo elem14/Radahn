@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <optional>
 #include <vector>
@@ -9,25 +10,20 @@
 
 namespace radahn::persistence {
 
+using WorkerHeartbeatClock =
+    std::chrono::system_clock;
+
+using WorkerHeartbeatTimePoint =
+    WorkerHeartbeatClock::time_point;
+
 class IWorkerRepository {
 public:
     virtual ~IWorkerRepository() = default;
 
-    /*
-     * Insert a newly registered worker.
-     *
-     * Implementations must reject duplicate worker IDs.
-     */
     virtual void insert(
         domain::WorkerRecord worker
     ) = 0;
 
-    /*
-     * Replace the current record for an existing worker.
-     *
-     * This is how future persistent implementations will
-     * save updated resources, state, and running-job counts.
-     */
     virtual void update(
         domain::WorkerRecord worker
     ) = 0;
@@ -44,6 +40,17 @@ public:
 
     [[nodiscard]]
     virtual bool contains(
+        const domain::WorkerId& worker_id
+    ) const = 0;
+
+    virtual void record_heartbeat(
+        const domain::WorkerId& worker_id,
+        WorkerHeartbeatTimePoint heartbeat_time
+    ) = 0;
+
+    [[nodiscard]]
+    virtual std::optional<WorkerHeartbeatTimePoint>
+    last_heartbeat(
         const domain::WorkerId& worker_id
     ) const = 0;
 

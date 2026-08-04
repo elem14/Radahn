@@ -6,6 +6,7 @@
 
 #include "radahn/domain/id.hpp"
 #include "radahn/domain/worker_record.hpp"
+
 #include "radahn/persistence/worker_repository.hpp"
 
 namespace radahn::persistence {
@@ -35,6 +36,17 @@ public:
         const domain::WorkerId& worker_id
     ) const override;
 
+    void record_heartbeat(
+        const domain::WorkerId& worker_id,
+        WorkerHeartbeatTimePoint heartbeat_time
+    ) override;
+
+    [[nodiscard]]
+    std::optional<WorkerHeartbeatTimePoint>
+    last_heartbeat(
+        const domain::WorkerId& worker_id
+    ) const override;
+
     void erase(
         const domain::WorkerId& worker_id
     ) override;
@@ -43,8 +55,13 @@ public:
     std::size_t size() const override;
 
 private:
-    std::vector<domain::WorkerRecord>
-        records_;
+    struct StoredWorker {
+        domain::WorkerRecord worker;
+        WorkerHeartbeatTimePoint
+            last_heartbeat;
+    };
+
+    std::vector<StoredWorker> records_;
 };
 
 }  // namespace radahn::persistence
