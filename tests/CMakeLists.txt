@@ -246,3 +246,24 @@ add_test(
     NAME radahn.sqlite_coordinator_integration
     COMMAND radahn-sqlite-coordinator-integration-tests
 )
+
+add_executable(
+    radahn-sqlite-coordinator-recovery-tests
+    unit/sqlite_coordinator_recovery_tests.cpp
+)
+
+target_link_libraries(
+    radahn-sqlite-coordinator-recovery-tests
+    PRIVATE
+        radahn_coordinator
+        radahn_persistence
+        radahn_scheduler
+        radahn_domain
+        radahn_project_options
+        radahn_project_warnings
+)
+
+add_test(
+    NAME radahn.sqlite_coordinator_recovery
+    COMMAND radahn-sqlite-coordinator-recovery-tests
+)

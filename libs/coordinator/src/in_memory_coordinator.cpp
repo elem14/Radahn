@@ -36,6 +36,7 @@ InMemoryCoordinator::InMemoryCoordinator(
           *owned_worker_repository_
       },
       planner_{policy} {
+    recover_persisted_state();
 }
 
 InMemoryCoordinator::InMemoryCoordinator(
@@ -46,6 +47,7 @@ InMemoryCoordinator::InMemoryCoordinator(
     : job_repository_{job_repository},
       worker_repository_{worker_repository},
       planner_{policy} {
+    recover_persisted_state();
 }
 
 void InMemoryCoordinator::submit_job(
@@ -666,6 +668,116 @@ void InMemoryCoordinator::finish_job(
         }
 
         throw;
+    }
+}
+
+void InMemoryCoordinator::recover_persisted_state() {
+
+    auto workers = 
+        worker_repository_.list();
+
+    for (auto& worker : workers) {
+        const auto snapshot = worker.snapshot();
+        const auto& resources = snapshot.resources();
+        domain::WorkerResources
+            recovered_resources{
+                resources.total_cpu_cores(),
+                resources.total_cpu_cores(),
+                resources.total_memory_bytes(),
+                resources.total_memory_bytes(),
+                resources.total_disk_bytes(),
+                resources.total_disk_bytes(),
+                resources.gpu_available()
+            };
+
+        domain::WorkerSnapshot 
+            recovered_snapshot{
+                worker.id(),
+                snapshot.state(),
+                std::move(recovered_resources),
+                0,
+                snapshot.max_concurrent_jobs(),
+                snapshot.tags()
+            };
+
+        worker_repository_.update(
+            domain::WorkerRecord{
+                std::move(recovered_snapshot)
+            }
+        );
+    }
+
+    auto records = job_repository_.list();
+
+    for (auto& record : records) {
+        switch (record.job.state()) {
+            case domain::JobState::queued:
+                queue_.enqueue(
+                    record.job
+                );
+                break;
+
+            case domain::JobState::leased:
+            case domain::JobState::running:
+            case domain::JobState::retry_wait: {
+
+                domain::Job recovered_job = 
+                    domain::Job::restore(
+                        record.job.id(),
+                        record.job.name(),
+                        record.job.priority(),
+                        record.job.requirements(),
+                        record.job.workload(),
+                        domain::JobState::queued,
+                        record.job.created_at()
+                    );
+
+                record.job = recovered_job;
+
+                record.assigned_worker_id.reset();
+
+                job_repository_.update(
+                    record
+                );
+
+                queue_.enqueue(
+                    std::move(recovered_job)
+                );
+
+                break;
+            }
+
+            case domain::JobState::
+                cancellation_requested: {
+                    domain::Job cancelled_job =
+                        domain::Job::restore(
+                            record.job.id(),
+                            record.job.name(),
+                            record.job.priority(),
+                            record.job.requirements(),
+                            record.job.workload(),
+                            domain::JobState::cancelled,
+                            record.job.created_at()
+                        );
+
+                    record.job = 
+                        std::move(cancelled_job);
+                    
+                    record.assigned_worker_id.reset();
+
+                    job_repository_.update(
+                        std::move(record)
+                    );
+
+                    break;
+                }
+
+                case domain::JobState::succeeded:
+                case domain::JobState::failed:
+                case domain::JobState::cancelled:
+
+                    break;
+        }
     }
 }
 

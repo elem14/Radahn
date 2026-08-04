@@ -144,9 +144,11 @@ private:
         domain::JobState terminal_state
     );
 
+    void recover_persisted_state();
+
     /*
-     * These are populated only by the convenience constructor.
-     * The injected constructor leaves them empty.
+     * These are populated only by the convenience constructor
+     * The injected constructor leaves them empty
      */
     std::unique_ptr<persistence::IJobRepository>
         owned_job_repository_;
@@ -155,8 +157,8 @@ private:
         owned_worker_repository_;
 
     /*
-     * All coordinator operations use these interfaces, regardless
-     * of whether the repositories are owned or injected.
+     * All coordinator operations use these interfaces regardless
+     * of whether the repositories are owned or injected
      */
     persistence::IJobRepository&
         job_repository_;
