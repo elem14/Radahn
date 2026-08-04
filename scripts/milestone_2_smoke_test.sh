@@ -215,6 +215,13 @@ then
     exit 1
 fi
 
+if ! grep -q "Heartbeat acknowledged" \
+    "${WORKER_LOG}"
+then
+    echo "Worker did not receive a successful heartbeat response."
+    exit 1
+fi
+
 if ! grep -q "Executing sleep workload" \
     "${WORKER_LOG}"
 then

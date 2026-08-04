@@ -13,6 +13,7 @@
 #include <grpcpp/grpcpp.h>
 
 #include "worker_service.grpc.pb.h"
+#include "heartbeat_loop.hpp"
 #include "radahn/domain/version.hpp"
 
 namespace {

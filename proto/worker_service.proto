@@ -7,6 +7,9 @@ import "client_service.proto";
 service WorkerService {
   rpc RegisterWorker(RegisterWorkerRequest)
       returns (RegisterWorkerResponse);
+  
+  rpc Heartbeat(HeartbeatRequest)
+      returns (HeartbeatResponse);
 
   rpc AcquireJob(AcquireJobRequest)
       returns (AcquireJobResponse);
@@ -42,6 +45,14 @@ message RegisterWorkerRequest {
 message RegisterWorkerResponse {
   string worker_id = 1;
   bool already_registered = 2;
+}
+
+message HeartbeatRequest {
+  string worker_id = 1;
+}
+
+message HeartbeatResponse {
+  int64 coordinator_time_unix_ms = 1;
 }
 
 message AcquireJobRequest {

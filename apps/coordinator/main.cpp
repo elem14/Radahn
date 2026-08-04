@@ -590,6 +590,11 @@ public:
                         std::move(worker_record)
                     );
                 }
+
+                worker_repository_.record_heartbeat(
+                    worker_id,
+                    radahn::persistence::WorkerHeartbeatClock::now()
+                );
             }
 
             response->set_worker_id(
@@ -607,6 +612,78 @@ public:
                 error.what()
             };
         } catch (const std::exception& error) {
+            return grpc::Status{
+                grpc::StatusCode::INTERNAL,
+                error.what()
+            };
+        }
+    }
+
+    grpc::Status Heartbeat(
+        grpc::ServerContext*,
+        const rpc::HeartbeatRequest* request,
+        rpc::HeartbeatResponse* response
+    ) override {
+        if (request->worker_id().empty()) {
+            return grpc::Status{
+                grpc::StatusCode::INVALID_ARGUMENT,
+                "Worker ID cannot be empty"
+            };
+        }
+
+        try {
+            const domain::WorkerId worker_id{
+                request->worker_id()
+            };
+
+            const auto heartbeat_time =
+                radahn::persistence::
+                    WorkerHeartbeatClock::now();
+
+            {
+                const std::lock_guard lock{
+                    mutex_
+                };
+
+                if (
+                    !worker_repository_.contains(
+                        worker_id
+                    )
+                ) {
+                    return grpc::Status{
+                        grpc::StatusCode::NOT_FOUND,
+                        "Worker is not registered"
+                    };
+                }
+
+                worker_repository_.record_heartbeat(
+                    worker_id,
+                    heartbeat_time
+                );
+            }
+
+            const auto coordinator_time_unix_ms =
+                std::chrono::duration_cast<
+                    std::chrono::milliseconds
+                >(
+                    heartbeat_time.time_since_epoch()
+                ).count();
+
+            response->set_coordinator_time_unix_ms(
+                coordinator_time_unix_ms
+            );
+
+            return grpc::Status::OK;
+        } catch (
+            const std::invalid_argument& error
+        ) {
+            return grpc::Status{
+                grpc::StatusCode::INVALID_ARGUMENT,
+                error.what()
+            };
+        } catch (
+            const std::exception& error
+        ) {
             return grpc::Status{
                 grpc::StatusCode::INTERNAL,
                 error.what()
