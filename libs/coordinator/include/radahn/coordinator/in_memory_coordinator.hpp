@@ -32,7 +32,9 @@ public:
      * with only a scheduling policy.
      */
     explicit InMemoryCoordinator(
-        scheduler::ISchedulingPolicy& policy
+        scheduler::ISchedulingPolicy& policy,
+        std::chrono::milliseconds lease_duration =
+            std::chrono::seconds{15}
     );
 
     /*
@@ -44,7 +46,9 @@ public:
     InMemoryCoordinator(
         scheduler::ISchedulingPolicy& policy,
         persistence::IJobRepository& job_repository,
-        persistence::IWorkerRepository& worker_repository
+        persistence::IWorkerRepository& worker_repository,
+        std::chrono::milliseconds lease_duration = 
+            std::chrono::seconds{15}
     );
 
     void submit_job(
@@ -177,6 +181,9 @@ private:
 
     persistence::IWorkerRepository&
         worker_repository_;
+
+    std::chrono::milliseconds 
+        lease_duration_;
 
     /*
      * The queue is still transient scheduling state.

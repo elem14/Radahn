@@ -18,7 +18,8 @@
 namespace radahn::coordinator {
 
 InMemoryCoordinator::InMemoryCoordinator(
-    scheduler::ISchedulingPolicy& policy
+    scheduler::ISchedulingPolicy& policy,
+    std::chrono::milliseconds lease_duration
 )
     : owned_job_repository_{
           std::make_unique<
@@ -36,18 +37,43 @@ InMemoryCoordinator::InMemoryCoordinator(
       worker_repository_{
           *owned_worker_repository_
       },
+      lease_duration_{
+          lease_duration
+      },
       planner_{policy} {
+    if (
+        lease_duration_ <=
+        std::chrono::milliseconds::zero()
+    ) {
+        throw std::invalid_argument{
+            "Job lease duration must be positive"
+        };
+    }
+
     recover_persisted_state();
 }
 
 InMemoryCoordinator::InMemoryCoordinator(
     scheduler::ISchedulingPolicy& policy,
     persistence::IJobRepository& job_repository,
-    persistence::IWorkerRepository& worker_repository
+    persistence::IWorkerRepository& worker_repository,
+    std::chrono::milliseconds lease_duration
 )
     : job_repository_{job_repository},
       worker_repository_{worker_repository},
+      lease_duration_{
+          lease_duration
+      },
       planner_{policy} {
+    if (
+        lease_duration_ <=
+        std::chrono::milliseconds::zero()
+    ) {
+        throw std::invalid_argument{
+            "Job lease duration must be positive"
+        };
+    }
+
     recover_persisted_state();
 }
 
@@ -144,6 +170,35 @@ void InMemoryCoordinator::record_worker_heartbeat(
         worker_id,
         heartbeat_time
     );
+
+    auto job_records =
+        job_repository_.list();
+
+    for (auto& record : job_records) {
+        if (
+            !record.assigned_worker_id.has_value() ||
+            *record.assigned_worker_id !=
+                worker_id
+        ) {
+            continue;
+        }
+
+        if (
+            !is_active_state(
+                record.job.state()
+            )
+        ) {
+            continue;
+        }
+
+        record.lease_expires_at =
+            heartbeat_time +
+            lease_duration_;
+
+        job_repository_.update(
+            std::move(record)
+        );
+    }
 }
 
 std::size_t
@@ -325,6 +380,10 @@ void InMemoryCoordinator::mark_running(
     record->job.transition_to(
         domain::JobState::running
     );
+
+    record->lease_expires_at = 
+        persistence::JobLeaseClock::now() +
+        lease_duration_;
 
     job_repository_.update(
         std::move(*record)
@@ -641,6 +700,10 @@ void InMemoryCoordinator::apply_dispatch_decision(
         stored_record->assigned_worker_id =
             decision.worker_id;
 
+        stored_record->lease_expires_at = 
+            persistence::JobLeaseClock::now() +
+            lease_duration_;
+
         worker_repository_.update(
             std::move(*worker)
         );
@@ -755,6 +818,8 @@ void InMemoryCoordinator::finish_job(
             terminal_state
         );
 
+        record->lease_expires_at.reset();
+
         worker_repository_.update(
             std::move(*worker)
         );
@@ -832,16 +897,30 @@ void InMemoryCoordinator::recover_persisted_state() {
     for (auto& record : records) {
         switch (record.job.state()) {
             case domain::JobState::queued:
+                
+                if (
+                    record.assigned_worker_id.has_value() ||
+                    record.lease_expires_at.has_value()
+                ) {
+                    record.assigned_worker_id.reset();
+                    record.lease_expires_at.reset();
+
+                    job_repository_.update(
+                        record
+                    );
+                }
+
                 queue_.enqueue(
                     record.job
                 );
+
                 break;
 
             case domain::JobState::leased:
             case domain::JobState::running:
             case domain::JobState::retry_wait: {
-
-                domain::Job recovered_job = 
+                
+                domain::Job recovered_job =
                     domain::Job::restore(
                         record.job.id(),
                         record.job.name(),
@@ -852,9 +931,11 @@ void InMemoryCoordinator::recover_persisted_state() {
                         record.job.created_at()
                     );
 
-                record.job = recovered_job;
+                record.job =
+                    recovered_job;
 
                 record.assigned_worker_id.reset();
+                record.lease_expires_at.reset();
 
                 job_repository_.update(
                     record
@@ -869,34 +950,43 @@ void InMemoryCoordinator::recover_persisted_state() {
 
             case domain::JobState::
                 cancellation_requested: {
-                    domain::Job cancelled_job =
-                        domain::Job::restore(
-                            record.job.id(),
-                            record.job.name(),
-                            record.job.priority(),
-                            record.job.requirements(),
-                            record.job.workload(),
-                            domain::JobState::cancelled,
-                            record.job.created_at()
-                        );
+                domain::Job cancelled_job =
+                    domain::Job::restore(
+                        record.job.id(),
+                        record.job.name(),
+                        record.job.priority(),
+                        record.job.requirements(),
+                        record.job.workload(),
+                        domain::JobState::cancelled,
+                        record.job.created_at()
+                    );
 
-                    record.job = 
-                        std::move(cancelled_job);
-                    
-                    record.assigned_worker_id.reset();
+                record.job =
+                    std::move(cancelled_job);
+
+                record.assigned_worker_id.reset();
+                record.lease_expires_at.reset();
+
+                job_repository_.update(
+                    std::move(record)
+                );
+
+                break;
+            }
+
+            case domain::JobState::succeeded:
+            case domain::JobState::failed:
+            case domain::JobState::cancelled:
+                
+                if (record.lease_expires_at.has_value()) {
+                    record.lease_expires_at.reset();
 
                     job_repository_.update(
                         std::move(record)
                     );
-
-                    break;
                 }
 
-                case domain::JobState::succeeded:
-                case domain::JobState::failed:
-                case domain::JobState::cancelled:
-
-                    break;
+                break;
         }
     }
 }
