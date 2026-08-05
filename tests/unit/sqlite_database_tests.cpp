@@ -66,8 +66,8 @@ void test_schema_creation() {
     expect(
         database.query_int64(
             "PRAGMA user_version;"
-        ) == 2,
-        "SQLite schema version is two"
+        ) == 3,
+        "SQLite schema version is three"
     );
 
     expect(
@@ -112,6 +112,16 @@ void test_schema_creation() {
     expect(
         database.query_int64(
             "SELECT COUNT(*) "
+            "FROM pragma_table_info('jobs') "
+            "WHERE name = "
+            "'lease_expires_at_unix_ms';"
+        ) == 1,
+        "Jobs table contains lease-expiration timestamp"
+    );
+
+    expect(
+        database.query_int64(
+            "SELECT COUNT(*) "
             "FROM sqlite_master "
             "WHERE type = 'table' "
             "AND name = 'job_required_tags';"
@@ -147,6 +157,15 @@ void test_schema_creation() {
         "Heartbeat schema migration is recorded"
     );
 
+    expect(
+        database.query_int64(
+            "SELECT COUNT(*) "
+            "FROM schema_migrations "
+            "WHERE version = 3;"
+        ) == 1,
+        "Job lease schema migration is recorded"
+    );
+
     /*
      * initializer must be safe to call again
      */
@@ -158,7 +177,7 @@ void test_schema_creation() {
         database.query_int64(
             "SELECT COUNT(*) "
             "FROM schema_migrations "
-            "WHERE version = 2;"
+            "WHERE version = 3;"
         ) == 1,
         "Schema initialization is idempotent"
     );

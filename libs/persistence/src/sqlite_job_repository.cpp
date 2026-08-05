@@ -213,6 +213,42 @@ void bind_optional_worker_id(
 }
 
 [[nodiscard]]
+std::int64_t lease_to_unix_ms(
+    JobLeaseTimePoint lease_time
+);
+
+void bind_optional_lease(
+    sqlite3* database,
+    sqlite3_stmt* statement,
+    int index,
+    const std::optional<JobLeaseTimePoint>&
+        lease_expires_at
+) {
+    if (!lease_expires_at.has_value()) {
+        require_bind_success(
+            database,
+            sqlite3_bind_null(
+                statement,
+                index
+            ),
+            "lease_expires_at_unix_ms"
+        );
+
+        return;
+    }
+
+    bind_int64(
+        database,
+        statement,
+        index,
+        lease_to_unix_ms(
+            *lease_expires_at
+        ),
+        "lease_expires_at_unix_ms"
+    );
+}
+
+[[nodiscard]]
 std::int64_t checked_sql_integer(
     std::uint64_t value,
     std::string_view field_name
@@ -258,6 +294,47 @@ std::uint64_t checked_unsigned_column(
     return static_cast<std::uint64_t>(
         value
     );
+}
+
+[[nodiscard]]
+std::int64_t lease_to_unix_ms(
+    JobLeaseTimePoint lease_time
+) {
+    const auto unix_ms =
+        std::chrono::duration_cast<
+            std::chrono::milliseconds
+        >(
+            lease_time.time_since_epoch()
+        ).count();
+
+    if (unix_ms < 0) {
+        throw std::invalid_argument{
+            "Lease expiration cannot be before the Unix epoch"
+        };
+    }
+
+    return unix_ms;
+}
+
+[[nodiscard]]
+JobLeaseTimePoint lease_from_unix_ms(
+    std::int64_t unix_ms
+) {
+    if (unix_ms < 0) {
+        throw std::runtime_error{
+            "Stored lease expiration timestamp is negative"
+        };
+    }
+
+    return JobLeaseTimePoint{
+        std::chrono::duration_cast<
+            JobLeaseClock::duration
+        >(
+            std::chrono::milliseconds{
+                unix_ms
+            }
+        )
+    };
 }
 
 [[nodiscard]]
@@ -688,6 +765,24 @@ persistence::JobRecord record_from_row(
             };
     }
 
+    std::optional<JobLeaseTimePoint>
+        lease_expires_at;
+
+    if (
+        sqlite3_column_type(
+            statement,
+            12
+        ) != SQLITE_NULL
+    ) {
+        lease_expires_at =
+            lease_from_unix_ms(
+                sqlite3_column_int64(
+                    statement,
+                    12
+                )
+            );
+    }
+
     const domain::JobId domain_job_id{
         job_id
     };
@@ -738,7 +833,8 @@ persistence::JobRecord record_from_row(
 
     return persistence::JobRecord{
         std::move(job),
-        std::move(assigned_worker_id)
+        std::move(assigned_worker_id),
+        std::move(lease_expires_at)
     };
 }
 
@@ -792,11 +888,12 @@ void SqliteJobRepository::insert(
                         workload_kind,
                         sleep_duration_ms,
                         created_at_unix_ms,
-                        assigned_worker_id
+                        assigned_worker_id,
+                        lease_expires_at_unix_ms
                     )
                     VALUES (
                         ?, ?, ?, ?, ?, ?, ?,
-                        ?, ?, ?, ?, ?
+                        ?, ?, ?, ?, ?, ?
                     );
                 )sql"
             );
@@ -921,6 +1018,13 @@ void SqliteJobRepository::insert(
             record.assigned_worker_id
         );
 
+        bind_optional_lease(
+            database,
+            statement.get(),
+            13,
+            record.lease_expires_at
+        );
+
         const int result =
             sqlite3_step(
                 statement.get()
@@ -993,7 +1097,8 @@ void SqliteJobRepository::update(
                         workload_kind = ?,
                         sleep_duration_ms = ?,
                         created_at_unix_ms = ?,
-                        assigned_worker_id = ?
+                        assigned_worker_id = ?,
+                        lease_expires_at_unix_ms = ?
                     WHERE job_id = ?;
                 )sql"
             );
@@ -1110,10 +1215,17 @@ void SqliteJobRepository::update(
             record.assigned_worker_id
         );
 
-        bind_text(
+        bind_optional_lease(
             database,
             statement.get(),
             12,
+            record.lease_expires_at
+        );
+
+        bind_text(
+            database,
+            statement.get(),
+            13,
             job_id.value(),
             "job_id"
         );
@@ -1181,7 +1293,8 @@ SqliteJobRepository::get(
                     workload_kind,
                     sleep_duration_ms,
                     created_at_unix_ms,
-                    assigned_worker_id
+                    assigned_worker_id,
+                    lease_expires_at_unix_ms
                 FROM jobs
                 WHERE job_id = ?;
             )sql"
@@ -1238,7 +1351,8 @@ SqliteJobRepository::list() const {
                     workload_kind,
                     sleep_duration_ms,
                     created_at_unix_ms,
-                    assigned_worker_id
+                    assigned_worker_id,
+                    lease_expires_at_unix_ms
                 FROM jobs
                 ORDER BY
                     created_at_unix_ms,

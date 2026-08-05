@@ -9,7 +9,7 @@ namespace radahn::persistence {
 
 namespace {
 
-constexpr std::int64_t current_schema_version = 2;
+constexpr std::int64_t current_schema_version = 3;
 
 void create_latest_schema(
     SqliteDatabase& database
@@ -93,6 +93,11 @@ void create_latest_schema(
 
                 assigned_worker_id TEXT,
 
+                lease_expires_at_unix_ms INTEGER
+                    CHECK(
+                        lease_expires_at_unix_ms >= 0
+                    ),
+
                 FOREIGN KEY (assigned_worker_id)
                     REFERENCES workers(worker_id)
                     ON DELETE SET NULL
@@ -124,6 +129,10 @@ void create_latest_schema(
             CREATE INDEX IF NOT EXISTS
                 index_jobs_assigned_worker
             ON jobs(assigned_worker_id);
+
+            CREATE INDEX IF NOT EXISTS
+                index_jobs_lease_expiration
+            ON jobs(lease_expires_at_unix_ms);
 
             CREATE INDEX IF NOT EXISTS
                 index_worker_tags_tag
@@ -180,9 +189,66 @@ void record_schema_migration(
         return;
     }
 
+    if (version == 3) {
+        database.execute(
+            R"sql(
+                INSERT OR IGNORE INTO schema_migrations (
+                    version,
+                    applied_at_unix_ms
+                )
+                VALUES (
+                    3,
+                    CAST(strftime('%s', 'now') AS INTEGER)
+                        * 1000
+                );
+            )sql"
+        );
+
+        return;
+    }
+
     throw std::logic_error{
         "Unknown SQLite schema migration"
     };
+}
+
+void upgrade_version_one_to_two(
+    SqliteDatabase& database
+) {
+    database.execute(
+        R"sql(
+            ALTER TABLE workers
+            ADD COLUMN last_heartbeat_unix_ms
+                INTEGER NOT NULL
+                DEFAULT 0
+                CHECK(last_heartbeat_unix_ms >= 0);
+        )sql"
+    );
+
+    record_schema_migration(
+        database,
+        2
+    );
+}
+
+void upgrade_version_two_to_three(
+    SqliteDatabase& database
+) {
+    database.execute(
+        R"sql(
+            ALTER TABLE jobs
+            ADD COLUMN lease_expires_at_unix_ms
+                INTEGER
+                CHECK(
+                    lease_expires_at_unix_ms >= 0
+                );
+        )sql"
+    );
+
+    record_schema_migration(
+        database,
+        3
+    );
 }
 
 }  // namespace
@@ -211,7 +277,10 @@ void initialize_sqlite_schema(
 
     try {
         if (existing_version == 0) {
-            
+            /*
+             * Brand-new databases receive the latest schema
+             * directly
+             */
             create_latest_schema(
                 database
             );
@@ -225,28 +294,33 @@ void initialize_sqlite_schema(
                 database,
                 2
             );
-        } else if (existing_version == 1) {
-            
-            database.execute(
-                R"sql(
-                    ALTER TABLE workers
-                    ADD COLUMN last_heartbeat_unix_ms
-                        INTEGER NOT NULL
-                        DEFAULT 0
-                        CHECK(last_heartbeat_unix_ms >= 0);
-                )sql"
-            );
-
-            create_latest_schema(
-                database
-            );
 
             record_schema_migration(
                 database,
-                2
+                3
             );
         } else {
-            
+            /*
+             * Apply each missing migration in order
+             */
+            if (existing_version < 2) {
+                upgrade_version_one_to_two(
+                    database
+                );
+            }
+
+            if (existing_version < 3) {
+                upgrade_version_two_to_three(
+                    database
+                );
+            }
+
+            /*
+             * Ensure all current tables and indexes exist
+             *
+             * CREATE ... IF NOT EXISTS makes this safe for
+             * already-current databases
+             */
             create_latest_schema(
                 database
             );
@@ -259,11 +333,16 @@ void initialize_sqlite_schema(
             record_schema_migration(
                 database,
                 2
+            );
+
+            record_schema_migration(
+                database,
+                3
             );
         }
 
         database.execute(
-            "PRAGMA user_version = 2;"
+            "PRAGMA user_version = 3;"
         );
 
         database.execute(
@@ -275,7 +354,7 @@ void initialize_sqlite_schema(
                 "ROLLBACK;"
             );
         } catch (...) {
-            // preserve original migration exception
+            // Preserve the original migration exception
         }
 
         throw;

@@ -66,6 +66,7 @@ void InMemoryCoordinator::submit_job(
 
     persistence::JobRecord record{
         job,
+        std::nullopt,
         std::nullopt
     };
 

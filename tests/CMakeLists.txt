@@ -307,3 +307,22 @@ add_test(
     NAME radahn.worker_liveness
     COMMAND radahn-worker-liveness-tests
 )
+
+add_executable(
+    radahn-job-lease-repository-tests
+    unit/job_lease_repository_tests.cpp
+)
+
+target_link_libraries(
+    radahn-job-lease-repository-tests
+    PRIVATE
+        radahn_persistence
+        radahn_domain
+        radahn_project_options
+        radahn_project_warnings
+)
+
+add_test(
+    NAME radahn.job_lease_repository
+    COMMAND radahn-job-lease-repository-tests
+)
