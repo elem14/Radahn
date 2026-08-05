@@ -1,5 +1,6 @@
 #include "radahn/coordinator/in_memory_coordinator.hpp"
 
+#include <chrono>
 #include <algorithm>
 #include <array>
 #include <memory>
@@ -97,6 +98,124 @@ void InMemoryCoordinator::register_worker(
     worker_repository_.insert(
         std::move(worker)
     );
+}
+
+void InMemoryCoordinator::record_worker_heartbeat(
+    const domain::WorkerId& worker_id,
+    persistence::WorkerHeartbeatTimePoint
+        heartbeat_time
+) {
+    auto worker =
+        worker_repository_.get(
+            worker_id
+        );
+
+    if (!worker.has_value()) {
+        throw std::invalid_argument{
+            "Cannot record a heartbeat for an unknown worker"
+        };
+    }
+
+    const auto snapshot =
+        worker->snapshot();
+
+    if (
+        snapshot.state() ==
+        domain::WorkerState::offline
+    ) {
+        domain::WorkerSnapshot online_snapshot{
+            worker->id(),
+            domain::WorkerState::online,
+            snapshot.resources(),
+            snapshot.running_jobs(),
+            snapshot.max_concurrent_jobs(),
+            snapshot.tags()
+        };
+
+        worker_repository_.update(
+            domain::WorkerRecord{
+                std::move(online_snapshot)
+            }
+        );
+    }
+
+    worker_repository_.record_heartbeat(
+        worker_id,
+        heartbeat_time
+    );
+}
+
+std::size_t
+InMemoryCoordinator::mark_stale_workers_offline(
+    persistence::WorkerHeartbeatTimePoint now,
+    std::chrono::milliseconds timeout
+) {
+    if (
+        timeout <=
+        std::chrono::milliseconds::zero()
+    ) {
+        throw std::invalid_argument{
+            "Worker heartbeat timeout must be positive"
+        };
+    }
+
+    const auto workers =
+        worker_repository_.list();
+
+    std::size_t marked_offline = 0;
+
+    for (const auto& worker : workers) {
+        const auto snapshot =
+            worker.snapshot();
+
+        if (
+            snapshot.state() !=
+            domain::WorkerState::online
+        ) {
+            continue;
+        }
+
+        const auto last_heartbeat =
+            worker_repository_.last_heartbeat(
+                worker.id()
+            );
+
+        if (!last_heartbeat.has_value()) {
+            throw std::logic_error{
+                "Stored worker has no heartbeat timestamp"
+            };
+        }
+
+        if (now < *last_heartbeat) {
+            continue;
+        }
+
+        const auto heartbeat_age =
+            now - *last_heartbeat;
+
+        if (heartbeat_age < timeout) {
+            continue;
+        }
+
+        domain::WorkerSnapshot offline_snapshot{
+            worker.id(),
+            domain::WorkerState::offline,
+            snapshot.resources(),
+            snapshot.running_jobs(),
+            snapshot.max_concurrent_jobs(),
+            snapshot.tags()
+        };
+
+        worker_repository_.update(
+            domain::WorkerRecord{
+                std::move(offline_snapshot)
+            }
+        );
+
+        ++marked_offline;
+    }
+
+    return marked_offline;
 }
 
 std::optional<scheduler::DispatchDecision>

@@ -13,6 +13,9 @@
 #include <utility>
 #include <vector>
 #include <filesystem>
+#include <atomic>
+#include <condition_variable>
+#include <thread>
 
 #include <grpcpp/grpcpp.h>
 
@@ -319,13 +322,30 @@ public:
         const std::filesystem::path& database_path
     )
         : database_{database_path},
-          job_repository_{database_},
-          worker_repository_{database_},
-          coordinator_{
-              policy_,
-              job_repository_,
-              worker_repository_
+        job_repository_{database_},
+        worker_repository_{database_},
+        coordinator_{
+            policy_,
+            job_repository_,
+            worker_repository_
+        },
+        liveness_thread_{
+            [this] {
+                run_liveness_monitor();
+            }
         } {
+    }
+
+    ~CoordinatorServiceImpl() {
+        stop_liveness_monitor_.store(
+            true
+        );
+
+        liveness_wait_condition_.notify_all();
+
+        if (liveness_thread_.joinable()) {
+            liveness_thread_.join();
+        }
     }
 
     grpc::Status Ping(
@@ -591,7 +611,7 @@ public:
                     );
                 }
 
-                worker_repository_.record_heartbeat(
+                coordinator_.record_worker_heartbeat(
                     worker_id,
                     radahn::persistence::WorkerHeartbeatClock::now()
                 );
@@ -656,7 +676,7 @@ public:
                     };
                 }
 
-                worker_repository_.record_heartbeat(
+                coordinator_.record_worker_heartbeat(
                     worker_id,
                     heartbeat_time
                 );
@@ -740,13 +760,6 @@ public:
                 }
             }
 
-            /*
-             * AcquireJobResponse contains only the JobInfo
-             * message, empty response = no job
-             *
-             * Protobuf automatically generates has_job()
-             * for the nested message field.
-             */
             if (!assigned_job.has_value()) {
                 return grpc::Status::OK;
             }
@@ -962,6 +975,64 @@ public:
     }
 
 private:
+
+void run_liveness_monitor() {
+    constexpr auto scan_interval =
+        std::chrono::seconds{1};
+
+    constexpr auto heartbeat_timeout =
+        std::chrono::seconds{6};
+
+    while (
+        !stop_liveness_monitor_.load()
+    ) {
+        std::size_t marked_offline = 0;
+
+        try {
+            {
+                const std::lock_guard lock{
+                    mutex_
+                };
+
+                marked_offline =
+                    coordinator_
+                        .mark_stale_workers_offline(
+                            radahn::persistence::
+                                WorkerHeartbeatClock::
+                                    now(),
+                            heartbeat_timeout
+                        );
+            }
+
+            if (marked_offline != 0) {
+                std::cout
+                    << "Marked "
+                    << marked_offline
+                    << " stale worker(s) offline"
+                    << '\n';
+            }
+        } catch (const std::exception& error) {
+            std::cerr
+                << "Worker liveness scan failed: "
+                << error.what()
+                << '\n';
+        }
+
+        std::unique_lock wait_lock{
+            liveness_wait_mutex_
+        };
+
+        liveness_wait_condition_.wait_for(
+            wait_lock,
+            scan_interval,
+            [this] {
+                return
+                    stop_liveness_monitor_
+                        .load();
+            }
+        );
+    }
+}
     /*
      * Member order matters
      *
@@ -987,6 +1058,24 @@ private:
         coordinator_;
 
     std::mutex mutex_;
+
+    std::atomic<bool>
+        stop_liveness_monitor_{
+            false
+        };
+
+    std::mutex
+        liveness_wait_mutex_;
+
+    std::condition_variable
+        liveness_wait_condition_;
+
+    /*
+    * Keep the thread last so every object it accesses has already
+    * been constructed before the thread starts
+    */
+    std::thread
+        liveness_thread_;
 
 };
 

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <memory>
 #include <optional>
@@ -52,6 +53,17 @@ public:
 
     void register_worker(
         domain::WorkerRecord worker
+    );
+
+    void record_worker_heartbeat(
+        const domain::WorkerId& worker_id,
+        persistence::WorkerHeartbeatTimePoint heartbeat_time
+    );
+
+    [[nodiscard]]
+    std::size_t mark_stale_workers_offline(
+        persistence::WorkerHeartbeatTimePoint now,
+        std::chrono::milliseconds timeout
     );
 
     [[nodiscard]]

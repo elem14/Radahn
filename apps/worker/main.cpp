@@ -365,6 +365,13 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    radahn::worker_app::HeartbeatLoop
+        heartbeat_loop{
+            coordinator_address,
+            worker_id,
+            std::chrono::seconds{2}
+        };
+
     while (true) {
         rpc::AcquireJobResponse response;
 

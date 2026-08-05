@@ -286,3 +286,24 @@ add_test(
     NAME radahn.worker_heartbeat_repository
     COMMAND radahn-worker-heartbeat-repository-tests
 )
+
+add_executable(
+    radahn-worker-liveness-tests
+    unit/worker_liveness_tests.cpp
+)
+
+target_link_libraries(
+    radahn-worker-liveness-tests
+    PRIVATE
+        radahn_coordinator
+        radahn_persistence
+        radahn_scheduler
+        radahn_domain
+        radahn_project_options
+        radahn_project_warnings
+)
+
+add_test(
+    NAME radahn.worker_liveness
+    COMMAND radahn-worker-liveness-tests
+)
