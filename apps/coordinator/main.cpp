@@ -987,8 +987,13 @@ void run_liveness_monitor() {
         !stop_liveness_monitor_.load()
     ) {
         std::size_t marked_offline = 0;
+        std::size_t expired_leases = 0;
 
         try {
+            const auto now =
+                radahn::persistence::
+                    WorkerHeartbeatClock::now();
+
             {
                 const std::lock_guard lock{
                     mutex_
@@ -997,10 +1002,14 @@ void run_liveness_monitor() {
                 marked_offline =
                     coordinator_
                         .mark_stale_workers_offline(
-                            radahn::persistence::
-                                WorkerHeartbeatClock::
-                                    now(),
+                            now,
                             heartbeat_timeout
+                        );
+
+                expired_leases =
+                    coordinator_
+                        .mark_expired_job_leases(
+                            now
                         );
             }
 
@@ -1011,9 +1020,17 @@ void run_liveness_monitor() {
                     << " stale worker(s) offline"
                     << '\n';
             }
+
+            if (expired_leases != 0) {
+                std::cout
+                    << "Marked "
+                    << expired_leases
+                    << " expired job lease(s) abandoned"
+                    << '\n';
+            }
         } catch (const std::exception& error) {
             std::cerr
-                << "Worker liveness scan failed: "
+                << "Coordinator recovery scan failed: "
                 << error.what()
                 << '\n';
         }

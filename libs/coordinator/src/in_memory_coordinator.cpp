@@ -274,6 +274,141 @@ InMemoryCoordinator::mark_stale_workers_offline(
     return marked_offline;
 }
 
+std::size_t
+InMemoryCoordinator::mark_expired_job_leases(
+    persistence::JobLeaseTimePoint now
+) {
+    auto records =
+        job_repository_.list();
+
+    std::size_t expired_count = 0;
+
+    for (auto& record : records) {
+        
+        if (!record.lease_expires_at.has_value()) {
+            continue;
+        }
+
+        if (now < *record.lease_expires_at) {
+            continue;
+        }
+
+        const auto current_state =
+            record.job.state();
+
+        if (!is_active_state(current_state)) {
+            record.lease_expires_at.reset();
+
+            job_repository_.update(
+                std::move(record)
+            );
+
+            continue;
+        }
+
+        const persistence::JobRecord
+            original_record{
+                record
+            };
+
+        std::optional<domain::WorkerRecord>
+            original_worker;
+
+        bool worker_updated = false;
+
+        try {
+        
+            if (
+                record.assigned_worker_id
+                    .has_value()
+            ) {
+                auto worker =
+                    worker_repository_.get(
+                        *record.assigned_worker_id
+                    );
+
+                if (worker.has_value()) {
+                    const auto snapshot =
+                        worker->snapshot();
+
+                    if (
+                        snapshot.running_jobs() > 0
+                    ) {
+                        original_worker =
+                            *worker;
+
+                        worker->release(
+                            record.job.requirements()
+                        );
+
+                        worker_repository_.update(
+                            std::move(*worker)
+                        );
+
+                        worker_updated = true;
+                    }
+                }
+            }
+
+            domain::JobState expired_state =
+                domain::JobState::retry_wait;
+
+            if (
+                current_state ==
+                domain::JobState::
+                    cancellation_requested
+            ) {
+                expired_state =
+                    domain::JobState::cancelled;
+            }
+
+            domain::Job expired_job =
+                domain::Job::restore(
+                    record.job.id(),
+                    record.job.name(),
+                    record.job.priority(),
+                    record.job.requirements(),
+                    record.job.workload(),
+                    expired_state,
+                    record.job.created_at()
+                );
+
+            record.job =
+                std::move(expired_job);
+
+            record.assigned_worker_id.reset();
+
+            record.lease_expires_at.reset();
+
+            job_repository_.update(
+                std::move(record)
+            );
+
+            ++expired_count;
+        } catch (...) {
+            
+            if (
+                worker_updated &&
+                original_worker.has_value()
+            ) {
+                try {
+                    worker_repository_.update(
+                        std::move(
+                            *original_worker
+                        )
+                    );
+                } catch (...) {
+                    // Preserve the original exception.
+                }
+            }
+
+            throw;
+        }
+    }
+
+    return expired_count;
+}
+
 std::optional<scheduler::DispatchDecision>
 InMemoryCoordinator::dispatch_once() {
     const auto workers =

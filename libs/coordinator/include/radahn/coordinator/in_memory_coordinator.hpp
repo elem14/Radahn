@@ -71,6 +71,11 @@ public:
     );
 
     [[nodiscard]]
+    std::size_t mark_expired_job_leases(
+        persistence::JobLeaseTimePoint now
+    );
+
+    [[nodiscard]]
     std::optional<scheduler::DispatchDecision>
     dispatch_once();
 
