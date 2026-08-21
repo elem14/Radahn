@@ -85,9 +85,11 @@ StatementPointer prepare_statement(
         );
 
     if (result != SQLITE_OK) {
-        throw database_error(
-            database,
-            "Could not prepare SQLite statement"
+        throw std::runtime_error(
+            std::string("Failed SQL:\n") + 
+            owned_sql + 
+            "\n\nSQLite says:\n" +
+            sqlite3_errmsg(database)
         );
     }
 
@@ -930,7 +932,7 @@ void SqliteJobRepository::insert(
                         sleep_duration_ms,
                         created_at_unix_ms,
                         assigned_worker_id,
-                        lease_expires_at_unix_ms
+                        lease_expires_at_unix_ms,
                         attempt_count,
                         max_attempts
                     )
