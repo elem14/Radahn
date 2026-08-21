@@ -988,6 +988,7 @@ void run_liveness_monitor() {
     ) {
         std::size_t marked_offline = 0;
         std::size_t expired_leases = 0;
+        std::size_t requeued_jobs = 0;
 
         try {
             const auto now =
@@ -1011,6 +1012,10 @@ void run_liveness_monitor() {
                         .mark_expired_job_leases(
                             now
                         );
+
+                requeued_jobs =
+                    coordinator_
+                        .requeue_retry_wait_jobs();
             }
 
             if (marked_offline != 0) {
@@ -1028,6 +1033,15 @@ void run_liveness_monitor() {
                     << " expired job lease(s) abandoned"
                     << '\n';
             }
+
+            if (requeued_jobs != 0) {
+                std::cout
+                    << "Requeued "
+                    << requeued_jobs
+                    << " abandoned job(s)"
+                    << '\n';
+            }
+
         } catch (const std::exception& error) {
             std::cerr
                 << "Coordinator recovery scan failed: "

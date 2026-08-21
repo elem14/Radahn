@@ -76,6 +76,9 @@ public:
     );
 
     [[nodiscard]]
+    std::size_t requeue_retry_wait_jobs();
+
+    [[nodiscard]]
     std::optional<scheduler::DispatchDecision>
     dispatch_once();
 

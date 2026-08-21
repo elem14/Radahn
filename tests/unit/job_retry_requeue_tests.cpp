@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <utility>
 
@@ -55,7 +56,7 @@ void expect(
 radahn::domain::Job make_job() {
     radahn::domain::ResourceRequirements
         requirements{
-            2.0,
+            1.0,
             512ULL * mebibyte,
             1024ULL * mebibyte,
             false,
@@ -64,9 +65,9 @@ radahn::domain::Job make_job() {
 
     return radahn::domain::Job{
         radahn::domain::JobId{
-            "lease-expiration-job"
+            "retry-requeue-job"
         },
-        "Lease expiration test job",
+        "Automatic retry test job",
         50,
         std::move(requirements),
         radahn::domain::WorkloadSpec::sleep(
@@ -75,7 +76,9 @@ radahn::domain::Job make_job() {
     };
 }
 
-radahn::domain::WorkerRecord make_worker() {
+radahn::domain::WorkerRecord make_worker(
+    std::string id
+) {
     radahn::domain::WorkerResources resources{
         8.0,
         8.0,
@@ -88,7 +91,7 @@ radahn::domain::WorkerRecord make_worker() {
 
     radahn::domain::WorkerSnapshot snapshot{
         radahn::domain::WorkerId{
-            "lease-expiration-worker"
+            std::move(id)
         },
         radahn::domain::WorkerState::online,
         std::move(resources),
@@ -102,7 +105,7 @@ radahn::domain::WorkerRecord make_worker() {
     };
 }
 
-void test_expired_running_job() {
+void test_abandoned_job_is_requeued() {
     using radahn::coordinator::
         InMemoryCoordinator;
 
@@ -138,29 +141,41 @@ void test_expired_running_job() {
     };
 
     const JobId job_id{
-        "lease-expiration-job"
+        "retry-requeue-job"
     };
 
-    const WorkerId worker_id{
-        "lease-expiration-worker"
+    const WorkerId crashed_worker_id{
+        "crashed-worker"
+    };
+
+    const WorkerId replacement_worker_id{
+        "replacement-worker"
     };
 
     coordinator.register_worker(
-        make_worker()
+        make_worker(
+            crashed_worker_id.value()
+        )
+    );
+
+    coordinator.register_worker(
+        make_worker(
+            replacement_worker_id.value()
+        )
     );
 
     coordinator.submit_job(
         make_job()
     );
 
-    const auto decision =
+    const auto first_dispatch =
         coordinator.dispatch_once_for_worker(
-            worker_id
+            crashed_worker_id
         );
 
     expect(
-        decision.has_value(),
-        "Job is dispatched before expiration"
+        first_dispatch.has_value(),
+        "Original worker receives job"
     );
 
     coordinator.mark_running(
@@ -176,14 +191,7 @@ void test_expired_running_job() {
         running_record.has_value() &&
         running_record->job.state() ==
             JobState::running,
-        "Job is RUNNING before lease expiration"
-    );
-
-    expect(
-        running_record.has_value() &&
-        running_record->lease_expires_at
-            .has_value(),
-        "Running job has a lease deadline"
+        "Original job reaches RUNNING"
     );
 
     if (
@@ -191,106 +199,153 @@ void test_expired_running_job() {
         !running_record->lease_expires_at
              .has_value()
     ) {
+        expect(
+            false,
+            "Running job has a lease deadline"
+        );
+
         return;
     }
 
     const auto lease_deadline =
         *running_record->lease_expires_at;
 
-    const auto early_expiration_count =
-        coordinator.mark_expired_job_leases(
-            lease_deadline -
-            std::chrono::milliseconds{1}
-        );
-
-    expect(
-        early_expiration_count == 0,
-        "Lease does not expire before its deadline"
-    );
-
-    expect(
-        coordinator.job_state(
-            job_id
-        ) == JobState::running,
-        "Job remains RUNNING before deadline"
-    );
-
-    const auto expiration_count =
+    const auto expired_count =
         coordinator.mark_expired_job_leases(
             lease_deadline
         );
 
     expect(
-        expiration_count == 1,
-        "Expired lease is detected"
+        expired_count == 1,
+        "Crashed worker's lease expires"
     );
 
-    const auto expired_record =
+    const auto retry_record =
         job_repository.get(
             job_id
         );
 
     expect(
-        expired_record.has_value() &&
-        expired_record->job.state() ==
+        retry_record.has_value() &&
+        retry_record->job.state() ==
             JobState::retry_wait,
-        "Expired job enters RETRY_WAIT"
+        "Abandoned job enters RETRY_WAIT"
     );
 
     expect(
-        expired_record.has_value() &&
-        !expired_record
-             ->assigned_worker_id
+        retry_record.has_value() &&
+        !retry_record->assigned_worker_id
              .has_value(),
-        "Expired assignment is cleared"
+        "Abandoned job has no assigned worker"
     );
+
+    const auto requeued_count =
+        coordinator.requeue_retry_wait_jobs();
 
     expect(
-        expired_record.has_value() &&
-        !expired_record
-             ->lease_expires_at
-             .has_value(),
-        "Expired lease timestamp is cleared"
+        requeued_count == 1,
+        "RETRY_WAIT job is requeued"
     );
 
-    const auto worker =
-        worker_repository.get(
-            worker_id
+    const auto queued_record =
+        job_repository.get(
+            job_id
         );
 
     expect(
-        worker.has_value() &&
-        worker->snapshot()
-            .running_jobs() == 0,
-        "Expired job releases worker slot"
+        queued_record.has_value() &&
+        queued_record->job.state() ==
+            JobState::queued,
+        "Recovered job returns to QUEUED"
     );
 
     expect(
-        worker.has_value() &&
-        worker->snapshot()
-            .resources()
-            .available_cpu_cores() == 8.0,
-        "Expired job releases worker CPU"
+        coordinator.queued_job_count() == 1,
+        "Recovered job appears in queued-job count"
     );
 
-    expect(
-        worker.has_value() &&
-        worker->snapshot()
-            .resources()
-            .available_memory_bytes() ==
-            16ULL * gibibyte,
-        "Expired job releases worker memory"
-    );
-
-    const auto repeated_expiration_count =
-        coordinator.mark_expired_job_leases(
-            lease_deadline +
-            std::chrono::minutes{1}
+    const auto replacement_dispatch =
+        coordinator.dispatch_once_for_worker(
+            replacement_worker_id
         );
 
     expect(
-        repeated_expiration_count == 0,
-        "Expired assignment is processed only once"
+        replacement_dispatch.has_value(),
+        "Replacement worker acquires recovered job"
+    );
+
+    expect(
+        replacement_dispatch.has_value() &&
+        replacement_dispatch->job_id ==
+            job_id,
+        "Replacement worker receives same logical job"
+    );
+
+    const auto replacement_leased_record =
+        job_repository.get(
+            job_id
+        );
+
+    expect(
+        replacement_leased_record.has_value() &&
+        replacement_leased_record
+            ->job.state() ==
+            JobState::leased,
+        "Recovered job receives a new lease"
+    );
+
+    expect(
+        replacement_leased_record.has_value() &&
+        replacement_leased_record
+            ->assigned_worker_id
+            .has_value() &&
+        *replacement_leased_record
+             ->assigned_worker_id ==
+            replacement_worker_id,
+        "Recovered job is assigned to replacement worker"
+    );
+
+    expect(
+        replacement_leased_record.has_value() &&
+        replacement_leased_record
+            ->lease_expires_at
+            .has_value(),
+        "Replacement assignment has a new lease deadline"
+    );
+
+    coordinator.mark_running(
+        job_id
+    );
+
+    coordinator.mark_succeeded(
+        job_id
+    );
+
+    const auto finished_record =
+        job_repository.get(
+            job_id
+        );
+
+    expect(
+        finished_record.has_value() &&
+        finished_record->job.state() ==
+            JobState::succeeded,
+        "Recovered job can complete successfully"
+    );
+
+    expect(
+        finished_record.has_value() &&
+        !finished_record->lease_expires_at
+             .has_value(),
+        "Successful retry clears replacement lease"
+    );
+
+    const auto repeated_requeue =
+        coordinator.requeue_retry_wait_jobs();
+
+    expect(
+        repeated_requeue == 0,
+        "Completed job is not requeued again"
     );
 }
 
@@ -298,10 +353,10 @@ void test_expired_running_job() {
 
 int main() {
     try {
-        test_expired_running_job();
+        test_abandoned_job_is_requeued();
     } catch (const std::exception& error) {
         std::cerr
-            << "Unexpected lease expiration exception: "
+            << "Unexpected retry requeue exception: "
             << error.what()
             << '\n';
 
@@ -312,13 +367,13 @@ int main() {
         std::cerr
             << '\n'
             << failure_count
-            << " lease expiration assertion(s) failed\n";
+            << " retry requeue assertion(s) failed\n";
 
         return EXIT_FAILURE;
     }
 
     std::cout
-        << "\nAll job lease expiration tests passed\n";
+        << "\nAll job retry requeue tests passed\n";
 
     return EXIT_SUCCESS;
 }

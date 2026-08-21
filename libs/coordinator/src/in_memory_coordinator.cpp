@@ -409,6 +409,75 @@ InMemoryCoordinator::mark_expired_job_leases(
     return expired_count;
 }
 
+std::size_t
+InMemoryCoordinator::requeue_retry_wait_jobs() {
+    auto records =
+        job_repository_.list();
+
+    std::size_t requeued_count = 0;
+
+    for (auto& record : records) {
+        if (
+            record.job.state() !=
+            domain::JobState::retry_wait
+        ) {
+            continue;
+        }
+
+        if (
+            record.assigned_worker_id.has_value() ||
+            record.lease_expires_at.has_value()
+        ) {
+            throw std::logic_error{
+                "RETRY_WAIT job still has an active assignment"
+            };
+        }
+
+        const persistence::JobRecord
+            original_record{
+                record
+            };
+
+        domain::Job queued_job =
+            domain::Job::restore(
+                record.job.id(),
+                record.job.name(),
+                record.job.priority(),
+                record.job.requirements(),
+                record.job.workload(),
+                domain::JobState::queued,
+                record.job.created_at()
+            );
+
+        record.job =
+            queued_job;
+
+        job_repository_.update(
+            record
+        );
+
+        try {
+            queue_.enqueue(
+                std::move(queued_job)
+            );
+        } catch (...) {
+            try {
+                job_repository_.update(
+                    original_record
+                );
+            } catch (...) {
+                // Preserve the original queue exception
+            }
+
+            throw;
+        }
+
+        ++requeued_count;
+    }
+
+    return requeued_count;
+}
+
 std::optional<scheduler::DispatchDecision>
 InMemoryCoordinator::dispatch_once() {
     const auto workers =
