@@ -9,7 +9,7 @@ namespace radahn::persistence {
 
 namespace {
 
-constexpr std::int64_t current_schema_version = 3;
+constexpr std::int64_t current_schema_version = 4;
 
 void create_latest_schema(
     SqliteDatabase& database
@@ -97,6 +97,14 @@ void create_latest_schema(
                     CHECK(
                         lease_expires_at_unix_ms >= 0
                     ),
+                
+                attempt_count INTEGER NOT NULL
+                    DEFAULT 0
+                    CHECK(attempt_count >= 0),
+
+                max_attempts INTEGER NOT NULL
+                    DEFAULT 3
+                    CHECK(max_attempts > 0),
 
                 FOREIGN KEY (assigned_worker_id)
                     REFERENCES workers(worker_id)
@@ -207,6 +215,24 @@ void record_schema_migration(
         return;
     }
 
+    if (version == 4) {
+        database.execute(
+            R"sql(
+                INSERT OR IGNORE INTO schema_migrations (
+                    version,
+                    applied_at_unix_ms
+                )
+                VALUES (
+                    4,
+                    CAST(strftime('%s', 'now') AS INTEGER)
+                        * 1000
+                    );
+                )sql"
+        );
+
+        return;
+    }
+
     throw std::logic_error{
         "Unknown SQLite schema migration"
     };
@@ -252,6 +278,35 @@ void upgrade_version_two_to_three(
 }
 
 }  // namespace
+
+void upgrade_version_three_to_four(
+    SqliteDatabase& database
+) {
+    database.execute(
+        R"sql(
+            ALTER TABLE jobs
+            ADD COLUMN attempt_count
+                INTEGER NOT NULL
+                DEFAULT 0
+                CHECK(attempt_count >= 0);
+        )sql"
+    );
+
+    database.execute(
+        R"sql(
+            ALTER TABLE jobs
+            ADD COLUMN max_attempts
+                INTEGER NOT NULL
+                DEFAULT 3
+                CHECK(max_attempts > 0);
+        )sql"
+    );
+
+    record_schema_migration(
+        database,
+        4
+    );
+}
 
 void initialize_sqlite_schema(
     SqliteDatabase& database
@@ -299,6 +354,12 @@ void initialize_sqlite_schema(
                 database,
                 3
             );
+
+            record_schema_migration(
+                database,
+                4
+            );
+
         } else {
             /*
              * Apply each missing migration in order
@@ -311,6 +372,12 @@ void initialize_sqlite_schema(
 
             if (existing_version < 3) {
                 upgrade_version_two_to_three(
+                    database
+                );
+            }
+
+            if (existing_version < 4) {
+                upgrade_version_three_to_four(
                     database
                 );
             }
@@ -339,10 +406,15 @@ void initialize_sqlite_schema(
                 database,
                 3
             );
+
+            record_schema_migration(
+                database,
+                4
+            );
         }
 
         database.execute(
-            "PRAGMA user_version = 3;"
+            "PRAGMA user_version = 4;"
         );
 
         database.execute(

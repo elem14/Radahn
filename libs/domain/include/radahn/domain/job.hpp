@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <string>
+#include <cstddef>
 
 #include "radahn/domain/id.hpp"
 #include "radahn/domain/job_state.hpp"
@@ -14,6 +15,9 @@ class Job {
 public:
     using Clock = std::chrono::system_clock;
     using TimePoint = Clock::time_point;
+
+    static constexpr std::size_t
+        default_max_attempts = 3;
 
     // Original constructor
     Job(
@@ -34,6 +38,16 @@ public:
         TimePoint created_at = Clock::now()
     );
 
+    Job(
+        JobId id,
+        std::string name,
+        int priority,
+        ResourceRequirements requirements,
+        WorkloadSpec workload,
+        std::size_t max_attempts,
+        TimePoint created_at = Clock::now()
+    );
+
     // reconstruct previously saved job
     [[nodiscard]]
     static Job restore(
@@ -43,7 +57,10 @@ public:
         ResourceRequirements requirements,
         WorkloadSpec workload,
         JobState state,
-        TimePoint created_at
+        TimePoint created_at,
+        std::size_t attempt_count = 0,
+        std::size_t max_attempts =
+            default_max_attempts
     );
 
     [[nodiscard]]
@@ -69,18 +86,30 @@ public:
     [[nodiscard]]
     TimePoint created_at() const noexcept;
 
+    [[nodiscard]]
+    std::size_t attempt_count() const noexcept;
+
+    [[nodiscard]]
+    std::size_t max_attempts() const noexcept;
+
+    [[nodiscard]]
+    bool can_attempt() const noexcept;
+
+    void record_attempt();
+
     void transition_to(JobState next_state);
 
 private:
-
     Job(
         JobId id,
-        std:: string name,
+        std::string name,
         int priority,
         ResourceRequirements requirements,
         WorkloadSpec workload,
         JobState state,
-        TimePoint created_at
+        TimePoint created_at,
+        std::size_t attempt_count,
+        std::size_t max_attempts
     );
 
     JobId id_;
@@ -90,8 +119,14 @@ private:
     ResourceRequirements requirements_;
     WorkloadSpec workload_;
 
-    JobState state_{JobState::queued};
+    JobState state_;
     TimePoint created_at_;
+
+    std::size_t attempt_count_{0};
+
+    std::size_t max_attempts_{
+        default_max_attempts
+    };
 };
 
-}  // namespace radahn::domain
+} // namespace radahn::domain

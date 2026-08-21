@@ -783,6 +783,41 @@ persistence::JobRecord record_from_row(
             );
     }
 
+    const std::uint64_t
+        stored_attempt_count =
+            checked_unsigned_column(
+                statement,
+                13,
+                "attempt_count"
+            );
+
+    const std::uint64_t
+        stored_max_attempts =
+            checked_unsigned_column(
+                statement,
+                14,
+                "max_attempts"
+            );
+
+    if (
+        stored_attempt_count >
+            static_cast<std::uint64_t>(
+                std::numeric_limits<
+                    std::size_t
+                >::max()
+            ) ||
+        stored_max_attempts >
+            static_cast<std::uint64_t>(
+                std::numeric_limits<
+                    std::size_t
+                >::max()
+            )
+    ) {
+        throw std::runtime_error{
+            "Stored retry metadata exceeds size_t"
+        };
+    }
+
     const domain::JobId domain_job_id{
         job_id
     };
@@ -828,7 +863,13 @@ persistence::JobRecord record_from_row(
             std::move(requirements),
             std::move(workload),
             state,
-            created_at
+            created_at,
+            static_cast<std::size_t>(
+                stored_attempt_count
+            ),
+            static_cast<std::size_t>(
+                stored_max_attempts
+            )
         );
 
     return persistence::JobRecord{
@@ -890,10 +931,12 @@ void SqliteJobRepository::insert(
                         created_at_unix_ms,
                         assigned_worker_id,
                         lease_expires_at_unix_ms
+                        attempt_count,
+                        max_attempts
                     )
                     VALUES (
                         ?, ?, ?, ?, ?, ?, ?,
-                        ?, ?, ?, ?, ?, ?
+                        ?, ?, ?, ?, ?, ?, ?, ?
                     );
                 )sql"
             );
@@ -1025,6 +1068,32 @@ void SqliteJobRepository::insert(
             record.lease_expires_at
         );
 
+        bind_int64(
+            database,
+            statement.get(),
+            14,
+            checked_sql_integer(
+                static_cast<std::uint64_t>(
+                    record.job.attempt_count()
+                ),
+                "attempt_count"
+            ),
+            "attempt_count"
+        );
+
+        bind_int64(
+            database,
+            statement.get(),
+            15,
+            checked_sql_integer(
+                static_cast<std::uint64_t>(
+                    record.job.max_attempts()
+                ),
+                "max_attempts"
+            ),
+            "max_attempts"
+        );
+
         const int result =
             sqlite3_step(
                 statement.get()
@@ -1098,7 +1167,9 @@ void SqliteJobRepository::update(
                         sleep_duration_ms = ?,
                         created_at_unix_ms = ?,
                         assigned_worker_id = ?,
-                        lease_expires_at_unix_ms = ?
+                        lease_expires_at_unix_ms = ?,
+                        attempt_count = ?,
+                        max_attempts = ?
                     WHERE job_id = ?;
                 )sql"
             );
@@ -1222,10 +1293,36 @@ void SqliteJobRepository::update(
             record.lease_expires_at
         );
 
-        bind_text(
+        bind_int64(
             database,
             statement.get(),
             13,
+            checked_sql_integer(
+                static_cast<std::uint64_t>(
+                    record.job.attempt_count()
+                ),
+                "attempt_count"
+            ),
+            "attempt_count"
+        );
+
+        bind_int64(
+            database,
+            statement.get(),
+            14,
+            checked_sql_integer(
+                static_cast<std::uint64_t>(
+                    record.job.max_attempts()
+                ),
+                "max_attempts"
+            ),
+            "max_attempts"
+        );
+
+        bind_text(
+            database,
+            statement.get(),
+            15,
             job_id.value(),
             "job_id"
         );
@@ -1294,7 +1391,9 @@ SqliteJobRepository::get(
                     sleep_duration_ms,
                     created_at_unix_ms,
                     assigned_worker_id,
-                    lease_expires_at_unix_ms
+                    lease_expires_at_unix_ms,
+                    attempt_count,
+                    max_attempts
                 FROM jobs
                 WHERE job_id = ?;
             )sql"
@@ -1352,7 +1451,9 @@ SqliteJobRepository::list() const {
                     sleep_duration_ms,
                     created_at_unix_ms,
                     assigned_worker_id,
-                    lease_expires_at_unix_ms
+                    lease_expires_at_unix_ms,
+                    attempt_count,
+                    max_attempts
                 FROM jobs
                 ORDER BY
                     created_at_unix_ms,

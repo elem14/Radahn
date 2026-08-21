@@ -389,3 +389,24 @@ add_test(
     NAME radahn.job_retry_requeue
     COMMAND radahn-job-retry-requeue-tests
 )
+
+add_executable(
+    radahn-job-retry-limit-tests
+    unit/job_retry_limit_tests.cpp
+)
+
+target_link_libraries(
+    radahn-job-retry-limit-tests
+    PRIVATE
+        radahn_coordinator
+        radahn_persistence
+        radahn_scheduler
+        radahn_domain
+        radahn_project_options
+        radahn_project_warnings
+)
+
+add_test(
+    NAME radahn.job_retry_limit
+    COMMAND radahn-job-retry-limit-tests
+)

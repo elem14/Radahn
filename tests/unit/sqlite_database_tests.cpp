@@ -66,8 +66,8 @@ void test_schema_creation() {
     expect(
         database.query_int64(
             "PRAGMA user_version;"
-        ) == 3,
-        "SQLite schema version is three"
+        ) == 4,
+        "SQLite schema version is four"
     );
 
     expect(
@@ -166,6 +166,15 @@ void test_schema_creation() {
         "Job lease schema migration is recorded"
     );
 
+    expect(
+        database.query_int64(
+            "SELECT COUNT(*) "
+            "FROM schema_migrations "
+            "WHERE version = 4;"
+        ) == 1,
+        "Retry schema migration is recorded"
+    );
+
     /*
      * initializer must be safe to call again
      */
@@ -177,10 +186,30 @@ void test_schema_creation() {
         database.query_int64(
             "SELECT COUNT(*) "
             "FROM schema_migrations "
-            "WHERE version = 3;"
+            "WHERE version = 4;"
         ) == 1,
         "Schema initialization is idempotent"
     );
+
+    expect(
+        database.query_int64(
+            "SELECT COUNT(*) "
+            "FROM pragma_table_info('jobs') "
+            "WHERE name = 'attempt_count';"
+        ) == 1,
+        "Jobs table contains attempt count"
+    );
+
+    expect(
+        database.query_int64(
+            "SELECT COUNT(*) "
+            "FROM pragma_table_info('jobs') "
+            "WHERE name = 'max_attempts';"
+        ) == 1,
+        "Jobs table contains max attempts"
+    );
+
+
 }
 
 void test_invalid_sql_is_rejected() {

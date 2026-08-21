@@ -370,7 +370,9 @@ InMemoryCoordinator::mark_expired_job_leases(
                     record.job.requirements(),
                     record.job.workload(),
                     expired_state,
-                    record.job.created_at()
+                    record.job.created_at(),
+                    record.job.attempt_count(),
+                    record.job.max_attempts()
                 );
 
             record.job =
@@ -433,6 +435,28 @@ InMemoryCoordinator::requeue_retry_wait_jobs() {
             };
         }
 
+    
+        if (!record.job.can_attempt()) {
+            record.job =
+                domain::Job::restore(
+                    record.job.id(),
+                    record.job.name(),
+                    record.job.priority(),
+                    record.job.requirements(),
+                    record.job.workload(),
+                    domain::JobState::failed,
+                    record.job.created_at(),
+                    record.job.attempt_count(),
+                    record.job.max_attempts()
+                );
+
+            job_repository_.update(
+                std::move(record)
+            );
+
+            continue;
+        }
+
         const persistence::JobRecord
             original_record{
                 record
@@ -446,7 +470,9 @@ InMemoryCoordinator::requeue_retry_wait_jobs() {
                 record.job.requirements(),
                 record.job.workload(),
                 domain::JobState::queued,
-                record.job.created_at()
+                record.job.created_at(),
+                record.job.attempt_count(),
+                record.job.max_attempts()
             );
 
         record.job =
@@ -466,7 +492,7 @@ InMemoryCoordinator::requeue_retry_wait_jobs() {
                     original_record
                 );
             } catch (...) {
-                // Preserve the original queue exception
+                // Preserve original queue exception
             }
 
             throw;
@@ -890,6 +916,14 @@ void InMemoryCoordinator::apply_dispatch_decision(
     bool job_repository_updated = false;
 
     try {
+        if (!selected_job->can_attempt()) {
+            throw std::logic_error{
+                "Scheduler selected a job that exhausted its retry limit"
+            };
+        }
+
+        selected_job->record_attempt();
+
         worker->reserve(
             selected_job->requirements()
         );
@@ -1100,30 +1134,61 @@ void InMemoryCoordinator::recover_persisted_state() {
 
     for (auto& record : records) {
         switch (record.job.state()) {
-            case domain::JobState::queued:
-                
-                if (
-                    record.assigned_worker_id.has_value() ||
-                    record.lease_expires_at.has_value()
-                ) {
-                    record.assigned_worker_id.reset();
-                    record.lease_expires_at.reset();
+            case domain::JobState::queued: {
+                record.assigned_worker_id.reset();
+                record.lease_expires_at.reset();
+
+                /*
+                * A queued job that has somehow already exhausted
+                * its attempts must not execute again.
+                */
+                if (!record.job.can_attempt()) {
+                    record.job =
+                        domain::Job::restore(
+                            record.job.id(),
+                            record.job.name(),
+                            record.job.priority(),
+                            record.job.requirements(),
+                            record.job.workload(),
+                            domain::JobState::failed,
+                            record.job.created_at(),
+                            record.job.attempt_count(),
+                            record.job.max_attempts()
+                        );
 
                     job_repository_.update(
-                        record
+                        std::move(record)
                     );
+
+                    break;
                 }
+
+                job_repository_.update(
+                    record
+                );
 
                 queue_.enqueue(
                     record.job
                 );
 
                 break;
+            }
 
             case domain::JobState::leased:
             case domain::JobState::running:
             case domain::JobState::retry_wait: {
-                
+                /*
+                * Any active assignment was abandoned by the old
+                * coordinator process.
+                *
+                * If attempts remain, return it to QUEUED.
+                * Otherwise the job has permanently FAILED.
+                */
+                const domain::JobState recovered_state =
+                    record.job.can_attempt()
+                        ? domain::JobState::queued
+                        : domain::JobState::failed;
+
                 domain::Job recovered_job =
                     domain::Job::restore(
                         record.job.id(),
@@ -1131,8 +1196,10 @@ void InMemoryCoordinator::recover_persisted_state() {
                         record.job.priority(),
                         record.job.requirements(),
                         record.job.workload(),
-                        domain::JobState::queued,
-                        record.job.created_at()
+                        recovered_state,
+                        record.job.created_at(),
+                        record.job.attempt_count(),
+                        record.job.max_attempts()
                     );
 
                 record.job =
@@ -1145,16 +1212,21 @@ void InMemoryCoordinator::recover_persisted_state() {
                     record
                 );
 
-                queue_.enqueue(
-                    std::move(recovered_job)
-                );
+                if (
+                    recovered_state ==
+                    domain::JobState::queued
+                ) {
+                    queue_.enqueue(
+                        std::move(recovered_job)
+                    );
+                }
 
                 break;
             }
 
             case domain::JobState::
                 cancellation_requested: {
-                domain::Job cancelled_job =
+                record.job =
                     domain::Job::restore(
                         record.job.id(),
                         record.job.name(),
@@ -1162,11 +1234,10 @@ void InMemoryCoordinator::recover_persisted_state() {
                         record.job.requirements(),
                         record.job.workload(),
                         domain::JobState::cancelled,
-                        record.job.created_at()
+                        record.job.created_at(),
+                        record.job.attempt_count(),
+                        record.job.max_attempts()
                     );
-
-                record.job =
-                    std::move(cancelled_job);
 
                 record.assigned_worker_id.reset();
                 record.lease_expires_at.reset();
@@ -1181,7 +1252,6 @@ void InMemoryCoordinator::recover_persisted_state() {
             case domain::JobState::succeeded:
             case domain::JobState::failed:
             case domain::JobState::cancelled:
-                
                 if (record.lease_expires_at.has_value()) {
                     record.lease_expires_at.reset();
 

@@ -22,7 +22,9 @@ Job::Job(
               std::chrono::seconds{1}
           ),
           JobState::queued,
-          created_at
+          created_at,
+          0,
+          default_max_attempts
       } {
 }
 
@@ -41,7 +43,31 @@ Job::Job(
           std::move(requirements),
           std::move(workload),
           JobState::queued,
-          created_at
+          created_at,
+          0,
+          default_max_attempts
+      } {
+}
+
+Job::Job(
+    JobId id,
+    std::string name,
+    int priority,
+    ResourceRequirements requirements,
+    WorkloadSpec workload,
+    std::size_t max_attempts,
+    TimePoint created_at
+)
+    : Job{
+          std::move(id),
+          std::move(name),
+          priority,
+          std::move(requirements),
+          std::move(workload),
+          JobState::queued,
+          created_at,
+          0,
+          max_attempts
       } {
 }
 
@@ -52,7 +78,9 @@ Job Job::restore(
     ResourceRequirements requirements,
     WorkloadSpec workload,
     JobState state,
-    TimePoint created_at
+    TimePoint created_at,
+    std::size_t attempt_count,
+    std::size_t max_attempts
 ) {
     return Job{
         std::move(id),
@@ -61,7 +89,9 @@ Job Job::restore(
         std::move(requirements),
         std::move(workload),
         state,
-        created_at
+        created_at,
+        attempt_count,
+        max_attempts
     };
 }
 
@@ -72,7 +102,9 @@ Job::Job(
     ResourceRequirements requirements,
     WorkloadSpec workload,
     JobState state,
-    TimePoint created_at
+    TimePoint created_at,
+    std::size_t attempt_count,
+    std::size_t max_attempts
 )
     : id_{std::move(id)},
       name_{std::move(name)},
@@ -80,10 +112,24 @@ Job::Job(
       requirements_{std::move(requirements)},
       workload_{std::move(workload)},
       state_{state},
-      created_at_{created_at} {
+      created_at_{created_at},
+      attempt_count_{attempt_count},
+      max_attempts_{max_attempts} {
     if (name_.empty()) {
         throw std::invalid_argument{
             "Job name cannot be empty"
+        };
+    }
+
+    if (max_attempts_ == 0) {
+        throw std::invalid_argument{
+            "Job max attempts must be positive"
+        };
+    }
+
+    if (attempt_count_ > max_attempts_) {
+        throw std::invalid_argument{
+            "Job attempt count cannot exceed max attempts"
         };
     }
 }
@@ -116,6 +162,38 @@ JobState Job::state() const noexcept {
 
 Job::TimePoint Job::created_at() const noexcept {
     return created_at_;
+}
+
+std::size_t
+Job::attempt_count() const noexcept {
+    return attempt_count_;
+}
+
+std::size_t
+Job::max_attempts() const noexcept {
+    return max_attempts_;
+}
+
+bool Job::can_attempt() const noexcept {
+    return
+        attempt_count_ <
+        max_attempts_;
+}
+
+void Job::record_attempt() {
+    if (state_ != JobState::queued) {
+        throw std::logic_error{
+            "Only a queued job can begin an attempt"
+        };
+    }
+
+    if (!can_attempt()) {
+        throw std::logic_error{
+            "Job has exhausted its retry limit"
+        };
+    }
+
+    ++attempt_count_;
 }
 
 void Job::transition_to(
