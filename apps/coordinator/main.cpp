@@ -179,6 +179,18 @@ void fill_job_info(
         job.workload(),
         output->mutable_workload()
     );
+
+    output->set_attempt_count(
+        static_cast<std::uint64_t>(
+            job.attempt_count()
+        )
+    );
+
+    output->set_max_attempts(
+        static_cast<std::uint64_t>(
+            job.max_attempts()
+        )
+    );
 }
 
 /*
@@ -407,6 +419,24 @@ public:
                     request->workload()
                 );
 
+            std::size_t max_attempts =
+                domain::Job::default_max_attempts;
+
+            if (request->max_attempts() != 0) {
+                max_attempts =
+                    checked_size_t(
+                        request->max_attempts(),
+                        "max_attempts"
+                    );
+
+                if (max_attempts == 0) {
+                    return grpc::Status{
+                        grpc::StatusCode::INVALID_ARGUMENT,
+                        "max_attempts must be positive"
+                    };
+                }
+            }
+
             domain::Job job{
                 job_id,
                 request->name(),
@@ -414,7 +444,8 @@ public:
                     request->priority()
                 ),
                 std::move(requirements),
-                std::move(workload)
+                std::move(workload),
+                max_attempts
             };
 
             {

@@ -63,6 +63,8 @@ message JobInfo {
   ResourceRequirements requirements = 5;
   int64 created_at_unix_ms = 6;
   WorkloadSpec workload = 7;
+  uint64 attempt_count = 8;
+  uint64 max_attempts = 9;
 }
 
 message SubmitJobRequest {
@@ -71,6 +73,7 @@ message SubmitJobRequest {
   int32 priority = 3;
   ResourceRequirements requirements = 4;
   WorkloadSpec workload = 5;
+  uint64 max_attempts = 6;
 }
 
 message SubmitJobResponse {

@@ -31,7 +31,7 @@ void print_usage() {
         << "  radahn ping [message]\n"
         << "  radahn job submit <id> <name> <priority>"
         << " <cpu> <memory-mib> <disk-mib>"
-        << " [--gpu] [--tag <tag>]...\n"
+        << " [--gpu] [--tag <tag>]... [--max-attempts <n>]\n"
         << "  radahn job get <id>\n"
         << "  radahn job list\n"
         << "  radahn help\n";
@@ -282,6 +282,13 @@ void print_job(
         std::cout
             << "  Workload: none\n";
     }
+
+    std::cout
+        << "  Attempts: "
+        << job.attempt_count()
+        << " / "
+        << job.max_attempts()
+        << '\n';
 }
 
 [[nodiscard]]
@@ -393,6 +400,8 @@ int run_submit_job(
 
         bool requires_gpu = false;
 
+        std::uint64_t max_attempts = 3;
+
         std::vector<std::string> tags;
 
         for (
@@ -423,6 +432,33 @@ int run_submit_job(
                 continue;
             }
 
+            if (argument == "--max-attempts") {
+                if (index + 1 >= argc) {
+                    throw std::invalid_argument{
+                        "--max-attempts requires a value"
+                    };
+                }
+
+                const int parsed_max_attempts =
+                    parse_int(
+                        argv[++index],
+                        "max-attempts"
+                    );
+
+                if (parsed_max_attempts <= 0) {
+                    throw std::invalid_argument{
+                        "max-attempts must be at least 1"
+                    };
+                }
+
+                max_attempts =
+                    static_cast<std::uint64_t>(
+                        parsed_max_attempts
+                    );
+
+                continue;
+            }
+
             throw std::invalid_argument{
                 "Unknown job option: " +
                 std::string{argument}
@@ -438,6 +474,10 @@ int run_submit_job(
             static_cast<std::int32_t>(
                 priority
             )
+        );
+
+        request.set_max_attempts(
+            max_attempts
         );
 
         auto* requirements =
@@ -613,7 +653,11 @@ int run_list_jobs(
             << " | priority "
             << job.priority()
             << " | "
-            << job.name();
+            << job.name()
+            << " | attempts "
+            << job.attempt_count()
+            << " / "
+            << job.max_attempts();
 
         if (job.has_workload()) {
             std::cout
