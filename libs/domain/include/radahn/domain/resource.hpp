@@ -32,6 +32,24 @@ private:
     std::vector<std::string> required_tags_;
 };
 
+class ResourceAllocation {
+public:
+    ResourceAllocation(
+        double cpu_cores,
+        std::uint64_t memory_bytes,
+        std::uint64_t disk_bytes
+    );
+
+    [[nodiscard]] double cpu_cores() const noexcept;
+    [[nodiscard]] std::uint64_t memory_bytes() const noexcept;
+    [[nodiscard]] std::uint64_t disk_bytes() const noexcept;
+
+private:
+    double cpu_cores_;
+    std::uint64_t memory_bytes_;
+    std::uint64_t disk_bytes_;
+};
+
 class WorkerResources {
 public:
     WorkerResources(

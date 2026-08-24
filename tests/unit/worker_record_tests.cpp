@@ -187,6 +187,89 @@ void test_failed_reservation_is_non_destructive() {
     );
 }
 
+void test_can_reserve_reports_capacity_without_mutating() {
+    auto worker = make_worker();
+
+    const bool fits =
+        worker.can_reserve(make_requirements());
+
+    const radahn::domain::ResourceRequirements excessive{
+        7.0,
+        14ULL * gibibyte,
+        400ULL * gibibyte,
+        false,
+        {"linux"}
+    };
+
+    const bool too_big =
+        worker.can_reserve(excessive);
+
+    const auto snapshot = worker.snapshot();
+
+    expect(
+        fits,
+        "can_reserve accepts requirements within capacity"
+    );
+
+    expect(
+        !too_big,
+        "can_reserve rejects requirements beyond capacity"
+    );
+
+    expect(
+        snapshot.resources().available_cpu_cores() ==
+            6.0,
+        "can_reserve does not mutate available CPU"
+    );
+
+    expect(
+        snapshot.running_jobs() == 1,
+        "can_reserve does not mutate running job count"
+    );
+}
+
+void test_available_and_allocated_resources() {
+    auto worker = make_worker();
+
+    worker.reserve(make_requirements());
+
+    const auto available =
+        worker.available_resources();
+
+    const auto allocated =
+        worker.allocated_resources();
+
+    expect(
+        available.cpu_cores() == 4.0,
+        "available_resources reflects reserved CPU"
+    );
+
+    expect(
+        available.memory_bytes() == 10ULL * gibibyte,
+        "available_resources reflects reserved memory"
+    );
+
+    expect(
+        available.disk_bytes() == 295ULL * gibibyte,
+        "available_resources reflects reserved disk"
+    );
+
+    expect(
+        allocated.cpu_cores() == 4.0,
+        "allocated_resources reflects reserved CPU"
+    );
+
+    expect(
+        allocated.memory_bytes() == 6ULL * gibibyte,
+        "allocated_resources reflects reserved memory"
+    );
+
+    expect(
+        allocated.disk_bytes() == 205ULL * gibibyte,
+        "allocated_resources reflects reserved disk"
+    );
+}
+
 void test_invalid_release_is_rejected() {
     auto worker = make_worker();
 
@@ -217,6 +300,8 @@ int main() {
     test_reservation_reduces_resources();
     test_release_restores_resources();
     test_failed_reservation_is_non_destructive();
+    test_can_reserve_reports_capacity_without_mutating();
+    test_available_and_allocated_resources();
     test_invalid_release_is_rejected();
 
     if (failure_count != 0) {

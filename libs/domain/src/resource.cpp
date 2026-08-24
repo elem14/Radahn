@@ -54,6 +54,28 @@ ResourceRequirements::required_tags() const noexcept {
     return required_tags_;
 }
 
+ResourceAllocation::ResourceAllocation(
+    double cpu_cores,
+    std::uint64_t memory_bytes,
+    std::uint64_t disk_bytes
+)
+    : cpu_cores_{cpu_cores},
+      memory_bytes_{memory_bytes},
+      disk_bytes_{disk_bytes} {
+}
+
+double ResourceAllocation::cpu_cores() const noexcept {
+    return cpu_cores_;
+}
+
+std::uint64_t ResourceAllocation::memory_bytes() const noexcept {
+    return memory_bytes_;
+}
+
+std::uint64_t ResourceAllocation::disk_bytes() const noexcept {
+    return disk_bytes_;
+}
+
 WorkerResources::WorkerResources(
     double total_cpu_cores,
     double available_cpu_cores,

@@ -19,6 +19,16 @@ public:
 
     [[nodiscard]] WorkerSnapshot snapshot() const;
 
+    [[nodiscard]] bool can_reserve(
+        const ResourceRequirements& requirements
+    ) const;
+
+    [[nodiscard]] ResourceAllocation
+    available_resources() const;
+
+    [[nodiscard]] ResourceAllocation
+    allocated_resources() const;
+
     void reserve(
         const ResourceRequirements& requirements
     );

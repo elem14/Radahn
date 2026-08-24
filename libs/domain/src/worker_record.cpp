@@ -64,15 +64,35 @@ WorkerSnapshot WorkerRecord::snapshot() const {
     };
 }
 
+bool WorkerRecord::can_reserve(
+    const ResourceRequirements& requirements
+) const {
+    return evaluate_worker(
+        requirements,
+        snapshot()
+    ).eligible();
+}
+
+ResourceAllocation WorkerRecord::available_resources() const {
+    return ResourceAllocation{
+        available_cpu_cores_,
+        available_memory_bytes_,
+        available_disk_bytes_
+    };
+}
+
+ResourceAllocation WorkerRecord::allocated_resources() const {
+    return ResourceAllocation{
+        total_cpu_cores_ - available_cpu_cores_,
+        total_memory_bytes_ - available_memory_bytes_,
+        total_disk_bytes_ - available_disk_bytes_
+    };
+}
+
 void WorkerRecord::reserve(
     const ResourceRequirements& requirements
 ) {
-    const auto eligibility = evaluate_worker(
-        requirements,
-        snapshot()
-    );
-
-    if (!eligibility.eligible()) {
+    if (!can_reserve(requirements)) {
         throw std::invalid_argument{
             "Worker cannot reserve the requested resources"
         };
