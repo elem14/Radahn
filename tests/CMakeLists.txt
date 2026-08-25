@@ -410,3 +410,45 @@ add_test(
     NAME radahn.job_retry_limit
     COMMAND radahn-job-retry-limit-tests
 )
+
+add_executable(
+    radahn-job-reservation-lifecycle-tests
+    unit/job_reservation_lifecycle_tests.cpp
+)
+
+target_link_libraries(
+    radahn-job-reservation-lifecycle-tests
+    PRIVATE
+        radahn_coordinator
+        radahn_persistence
+        radahn_scheduler
+        radahn_domain
+        radahn_project_options
+        radahn_project_warnings
+)
+
+add_test(
+    NAME radahn.job_reservation_lifecycle
+    COMMAND radahn-job-reservation-lifecycle-tests
+)
+
+add_executable(
+    radahn-dynamic-resource-fit-tests
+    unit/dynamic_resource_fit_tests.cpp
+)
+
+target_link_libraries(
+    radahn-dynamic-resource-fit-tests
+    PRIVATE
+        radahn_coordinator
+        radahn_persistence
+        radahn_scheduler
+        radahn_domain
+        radahn_project_options
+        radahn_project_warnings
+)
+
+add_test(
+    NAME radahn.dynamic_resource_fit
+    COMMAND radahn-dynamic-resource-fit-tests
+)
