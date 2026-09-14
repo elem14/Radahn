@@ -6,6 +6,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #include "radahn/domain/id.hpp"
 #include "radahn/domain/job.hpp"
@@ -256,6 +257,93 @@ void test_deterministic_id_tiebreaker() {
     );
 }
 
+void test_full_ordering_across_all_tiers() {
+    using radahn::domain::Job;
+    using radahn::scheduler::InMemoryJobQueue;
+
+    const Job::TimePoint base_time{};
+
+    InMemoryJobQueue queue;
+
+    // Deliberately enqueued out of every tier's order, so a
+    // passing test proves priority, then created_at, then job_id
+    // are all applied, in that precedence.
+    queue.enqueue(
+        make_job("low-old", 10, base_time)
+    );
+
+    queue.enqueue(
+        make_job(
+            "high-newer",
+            100,
+            base_time + std::chrono::seconds{5}
+        )
+    );
+
+    queue.enqueue(
+        make_job("high-older-b", 100, base_time)
+    );
+
+    queue.enqueue(
+        make_job("high-older-a", 100, base_time)
+    );
+
+    queue.enqueue(
+        make_job(
+            "mid",
+            50,
+            base_time + std::chrono::seconds{1}
+        )
+    );
+
+    const std::vector<std::string> expected_order{
+        "high-older-a",
+        "high-older-b",
+        "high-newer",
+        "mid",
+        "low-old"
+    };
+
+    const auto ordered = queue.ordered_jobs();
+
+    bool ordered_jobs_matches = ordered.size() ==
+        expected_order.size();
+
+    if (ordered_jobs_matches) {
+        for (std::size_t i = 0; i < ordered.size(); ++i) {
+            if (ordered[i]->id().value() !=
+                expected_order[i]) {
+                ordered_jobs_matches = false;
+                break;
+            }
+        }
+    }
+
+    expect(
+        ordered_jobs_matches,
+        "ordered_jobs() applies priority, then created_at, "
+        "then job_id, in precedence order"
+    );
+
+    bool pop_next_matches = true;
+
+    for (const auto& expected_id : expected_order) {
+        const auto selected = queue.pop_next();
+
+        if (!selected.has_value() ||
+            selected->id().value() != expected_id) {
+            pop_next_matches = false;
+            break;
+        }
+    }
+
+    expect(
+        pop_next_matches && queue.empty(),
+        "Sequential pop_next() drains the queue in the same "
+        "order as ordered_jobs()"
+    );
+}
+
 void test_pop_removes_job() {
     using radahn::domain::Job;
     using radahn::scheduler::InMemoryJobQueue;
@@ -447,6 +535,7 @@ int main() {
     test_priority_ordering();
     test_fifo_for_equal_priority();
     test_deterministic_id_tiebreaker();
+    test_full_ordering_across_all_tiers();
     test_pop_removes_job();
     test_duplicate_job_rejected();
     test_nonqueued_job_rejected();

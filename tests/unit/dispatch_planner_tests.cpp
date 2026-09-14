@@ -347,6 +347,144 @@ void test_least_loaded_worker_is_used() {
     );
 }
 
+void test_blocked_high_priority_job_dispatches_first_once_eligible() {
+    using radahn::scheduler::DispatchPlanner;
+    using radahn::scheduler::InMemoryJobQueue;
+    using radahn::scheduler::LeastLoadedPolicy;
+
+    InMemoryJobQueue queue;
+
+    // High-priority job that cannot run on the only
+    // available worker yet (no GPU).
+    queue.enqueue(
+        make_job(
+            "gpu-job",
+            100,
+            make_gpu_requirements()
+        )
+    );
+
+    queue.enqueue(
+        make_job(
+            "cpu-job-1",
+            50,
+            make_cpu_requirements()
+        )
+    );
+
+    queue.enqueue(
+        make_job(
+            "cpu-job-2",
+            40,
+            make_cpu_requirements()
+        )
+    );
+
+    LeastLoadedPolicy policy;
+    DispatchPlanner planner{policy};
+
+    {
+        const std::vector workers{
+            make_worker(
+                "cpu-worker",
+                6.0,
+                false,
+                0,
+                4,
+                {"linux"}
+            )
+        };
+
+        // While no GPU worker exists, lower-priority CPU
+        // jobs are dispatched around the blocked job instead
+        // of the queue stalling.
+        const auto first_decision = planner.plan(
+            queue,
+            std::span<
+                const radahn::domain::WorkerSnapshot
+            >{workers}
+        );
+
+        expect(
+            first_decision.has_value() &&
+            first_decision->job_id.value() == "cpu-job-1",
+            "Lower-priority job dispatches while high-priority "
+            "job is blocked"
+        );
+
+        static_cast<void>(
+            queue.take(
+                radahn::domain::JobId{"cpu-job-1"}
+            )
+        );
+
+        const auto second_decision = planner.plan(
+            queue,
+            std::span<
+                const radahn::domain::WorkerSnapshot
+            >{workers}
+        );
+
+        expect(
+            second_decision.has_value() &&
+            second_decision->job_id.value() == "cpu-job-2",
+            "Next-highest-priority schedulable job dispatches "
+            "next while blocked job keeps waiting"
+        );
+
+        static_cast<void>(
+            queue.take(
+                radahn::domain::JobId{"cpu-job-2"}
+            )
+        );
+    }
+
+    expect(
+        queue.contains(
+            radahn::domain::JobId{"gpu-job"}
+        ),
+        "Blocked high-priority job was never lost or "
+        "silently dropped while waiting"
+    );
+
+    // A GPU worker now shows up alongside a fresh, newly
+    // enqueued job of lower priority.
+    queue.enqueue(
+        make_job(
+            "late-low-priority",
+            10,
+            make_cpu_requirements()
+        )
+    );
+
+    const std::vector workers_with_gpu{
+        make_worker(
+            "gpu-worker",
+            6.0,
+            true,
+            0,
+            4,
+            {"linux", "gpu"}
+        )
+    };
+
+    const auto decision = planner.plan(
+        queue,
+        std::span<
+            const radahn::domain::WorkerSnapshot
+        >{workers_with_gpu}
+    );
+
+    expect(
+        decision.has_value() &&
+        decision->job_id.value() == "gpu-job",
+        "Previously-blocked high-priority job dispatches "
+        "immediately once an eligible worker appears, ahead "
+        "of any newer lower-priority job — no permanent "
+        "starvation"
+    );
+}
+
 void test_empty_queue_returns_no_decision() {
     using radahn::scheduler::DispatchPlanner;
     using radahn::scheduler::InMemoryJobQueue;
@@ -388,6 +526,7 @@ int main() {
     test_unschedulable_job_does_not_block_queue();
     test_no_decision_when_nothing_can_run();
     test_least_loaded_worker_is_used();
+    test_blocked_high_priority_job_dispatches_first_once_eligible();
     test_empty_queue_returns_no_decision();
 
     if (failure_count != 0) {
