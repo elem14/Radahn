@@ -452,3 +452,22 @@ add_test(
     NAME radahn.dynamic_resource_fit
     COMMAND radahn-dynamic-resource-fit-tests
 )
+
+add_executable(
+    radahn-best-fit-policy-tests
+    unit/best_fit_policy_tests.cpp
+)
+
+target_link_libraries(
+    radahn-best-fit-policy-tests
+    PRIVATE
+        radahn_scheduler
+        radahn_domain
+        radahn_project_options
+        radahn_project_warnings
+)
+
+add_test(
+    NAME radahn.best_fit_policy
+    COMMAND radahn-best-fit-policy-tests
+)

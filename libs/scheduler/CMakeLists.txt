@@ -6,6 +6,7 @@ target_sources(
         src/worker_filter.cpp
         src/round_robin_policy.cpp
         src/least_loaded_policy.cpp
+        src/best_fit_policy.cpp
         src/job_queue.cpp
         src/dispatch_planner.cpp
 )
