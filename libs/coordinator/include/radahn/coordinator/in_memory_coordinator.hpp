@@ -75,6 +75,30 @@ public:
         persistence::JobLeaseTimePoint now
     );
 
+    /*
+     * Extend the lease of every job in active_job_ids that is
+     * currently RUNNING and assigned to worker_id.
+     *
+     * This lets a worker keep long-running jobs alive independently
+     * of one another: a job the worker no longer reports as active
+     * (crashed, hung, or simply not included) keeps its existing
+     * lease and can still expire on schedule, while jobs the worker
+     * confirms are still running never do.
+     *
+     * Job IDs that don't exist, aren't RUNNING, or aren't assigned
+     * to this worker are silently ignored — the worker's view of
+     * its own active jobs may be briefly stale relative to the
+     * coordinator's.
+     *
+     * Returns the number of leases actually renewed.
+     */
+    [[nodiscard]]
+    std::size_t renew_job_leases_for_worker(
+        const domain::WorkerId& worker_id,
+        const std::vector<domain::JobId>& active_job_ids,
+        persistence::JobLeaseTimePoint now
+    );
+
     [[nodiscard]]
     std::size_t requeue_retry_wait_jobs();
 

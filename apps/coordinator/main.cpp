@@ -691,6 +691,23 @@ public:
                 radahn::persistence::
                     WorkerHeartbeatClock::now();
 
+            std::vector<domain::JobId> active_job_ids;
+
+            active_job_ids.reserve(
+                static_cast<std::size_t>(
+                    request->active_job_ids_size()
+                )
+            );
+
+            for (
+                const auto& job_id :
+                request->active_job_ids()
+            ) {
+                active_job_ids.emplace_back(
+                    job_id
+                );
+            }
+
             {
                 const std::lock_guard lock{
                     mutex_
@@ -710,6 +727,15 @@ public:
                 coordinator_.record_worker_heartbeat(
                     worker_id,
                     heartbeat_time
+                );
+
+                static_cast<void>(
+                    coordinator_
+                        .renew_job_leases_for_worker(
+                            worker_id,
+                            active_job_ids,
+                            heartbeat_time
+                        )
                 );
             }
 

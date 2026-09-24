@@ -12,6 +12,8 @@
 
 #include "worker_service.grpc.pb.h"
 
+#include "active_job_registry.hpp"
+
 namespace radahn::worker_app {
 
 class HeartbeatLoop final {
@@ -19,6 +21,7 @@ public:
     HeartbeatLoop(
         std::string coordinator_address,
         std::string worker_id,
+        const ActiveJobRegistry& active_jobs,
         std::chrono::milliseconds interval =
             std::chrono::seconds{2}
     );
@@ -49,6 +52,8 @@ private:
     > stub_;
 
     std::string worker_id_;
+
+    const ActiveJobRegistry& active_jobs_;
 
     std::chrono::milliseconds interval_;
 

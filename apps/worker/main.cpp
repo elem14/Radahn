@@ -1,6 +1,9 @@
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <csignal>
 #include <cstdint>
+#include <future>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -13,6 +16,7 @@
 #include <grpcpp/grpcpp.h>
 
 #include "worker_service.grpc.pb.h"
+#include "active_job_registry.hpp"
 #include "heartbeat_loop.hpp"
 #include "radahn/domain/version.hpp"
 
@@ -22,6 +26,63 @@ namespace rpc = radahn::rpc::v1;
 
 constexpr std::uint64_t gibibyte =
     1024ULL * 1024ULL * 1024ULL;
+
+/*
+ * Set only from a signal handler (SIGINT/SIGTERM); every other
+ * access is a lock-free read from the main loop. sig_atomic_t via
+ * std::atomic is the standard safe pattern for a handler that must
+ * not do anything beyond flipping a flag.
+ */
+std::atomic<bool> g_shutdown_requested{false};
+
+extern "C" void handle_shutdown_signal(int) {
+    g_shutdown_requested.store(true);
+}
+
+[[nodiscard]] unsigned int detected_cpu_count() {
+    return std::max(
+        1U,
+        std::thread::hardware_concurrency()
+    );
+}
+
+[[nodiscard]] std::uint64_t
+default_max_concurrent_jobs() {
+    return std::min<std::uint64_t>(
+        detected_cpu_count(),
+        4ULL
+    );
+}
+
+/*
+ * Sleep in short increments so a requested shutdown is noticed
+ * promptly instead of waiting out a full backoff/poll interval.
+ */
+void interruptible_sleep(
+    std::chrono::milliseconds duration
+) {
+    constexpr std::chrono::milliseconds
+        poll_granularity{100};
+
+    auto remaining = duration;
+
+    while (
+        remaining > std::chrono::milliseconds::zero() &&
+        !g_shutdown_requested.load()
+    ) {
+        const auto this_sleep =
+            std::min(
+                remaining,
+                poll_granularity
+            );
+
+        std::this_thread::sleep_for(
+            this_sleep
+        );
+
+        remaining -= this_sleep;
+    }
+}
 
 [[nodiscard]] std::vector<std::string>
 default_worker_tags() {
@@ -78,15 +139,9 @@ grpc::Status register_worker(
     rpc::WorkerService::Stub& stub,
     const std::string& worker_id
 ) {
-    const unsigned int detected_cpu_count =
-        std::max(
-            1U,
-            std::thread::hardware_concurrency()
-        );
-
     const double cpu_cores =
         static_cast<double>(
-            detected_cpu_count
+            detected_cpu_count()
         );
 
     const std::uint64_t configured_memory =
@@ -96,10 +151,7 @@ grpc::Status register_worker(
         50ULL * gibibyte;
 
     const std::uint64_t max_concurrent_jobs =
-        std::min<std::uint64_t>(
-            detected_cpu_count,
-            4ULL
-        );
+        default_max_concurrent_jobs();
 
     rpc::RegisterWorkerRequest request;
 
@@ -365,14 +417,74 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    std::signal(SIGINT, handle_shutdown_signal);
+    std::signal(SIGTERM, handle_shutdown_signal);
+
+    radahn::worker_app::ActiveJobRegistry
+        active_jobs;
+
     radahn::worker_app::HeartbeatLoop
         heartbeat_loop{
             coordinator_address,
             worker_id,
+            active_jobs,
             std::chrono::seconds{2}
         };
 
-    while (true) {
+    const std::uint64_t max_concurrent_jobs =
+        default_max_concurrent_jobs();
+
+    std::cout
+        << "Worker ready; up to "
+        << max_concurrent_jobs
+        << " concurrent job(s)\n";
+
+    std::vector<std::future<void>>
+        running_jobs;
+
+    while (!g_shutdown_requested.load()) {
+        running_jobs.erase(
+            std::remove_if(
+                running_jobs.begin(),
+                running_jobs.end(),
+                [](std::future<void>& job_future) {
+                    if (
+                        job_future.wait_for(
+                            std::chrono::seconds::zero()
+                        ) !=
+                        std::future_status::ready
+                    ) {
+                        return false;
+                    }
+
+                    try {
+                        job_future.get();
+                    } catch (
+                        const std::exception& error
+                    ) {
+                        std::cerr
+                            << "Job execution thread raised: "
+                            << error.what()
+                            << '\n';
+                    }
+
+                    return true;
+                }
+            ),
+            running_jobs.end()
+        );
+
+        if (
+            running_jobs.size() >=
+            max_concurrent_jobs
+        ) {
+            interruptible_sleep(
+                std::chrono::milliseconds{200}
+            );
+
+            continue;
+        }
+
         rpc::AcquireJobResponse response;
 
         const grpc::Status status =
@@ -393,10 +505,21 @@ int main(int argc, char* argv[]) {
                 << status.error_message()
                 << '\n';
 
-            return 1;
+            interruptible_sleep(
+                std::chrono::seconds{2}
+            );
+
+            continue;
         }
 
-        if (response.has_job()) {
+        if (!response.has_job()) {
+            interruptible_sleep(
+                std::chrono::seconds{2}
+            );
+
+            continue;
+        }
+
         print_job(response.job());
 
         rpc::StartJobResponse start_response;
@@ -418,63 +541,102 @@ int main(int argc, char* argv[]) {
                 )
                 << "): "
                 << start_status.error_message()
-                << '\n';
+                << "; will retry acquiring it\n";
 
-            return 1;
+            continue;
         }
 
         std::cout
             << "Job entered RUNNING state\n";
 
-        const bool succeeded =
-            execute_job(response.job());
+        const std::string job_id =
+            response.job().id();
 
-        rpc::FinishJobResponse finish_response;
+        const rpc::JobInfo job_info =
+            response.job();
 
-        const grpc::Status finish_status =
-            finish_job(
-                *stub,
-                worker_id,
-                response.job().id(),
-                succeeded
-                    ? rpc::JOB_OUTCOME_SUCCEEDED
-                    : rpc::JOB_OUTCOME_FAILED,
-                &finish_response
-            );
+        active_jobs.add(job_id);
 
-        if (!finish_status.ok()) {
-            std::cerr
-                << "Could not finish job"
-                << " (gRPC code "
-                << static_cast<int>(
-                    finish_status.error_code()
-                )
-                << "): "
-                << finish_status.error_message()
-                << '\n';
+        running_jobs.push_back(
+            std::async(
+                std::launch::async,
+                [
+                    &stub_ref = *stub,
+                    &active_jobs,
+                    worker_id,
+                    job_id,
+                    job_info
+                ]() {
+                    const bool succeeded =
+                        execute_job(job_info);
 
-            return 1;
-        }
+                    rpc::FinishJobResponse
+                        finish_response;
 
-        std::cout
-            << "Job completed with state "
-            << (
-                succeeded
-                    ? "SUCCEEDED"
-                    : "FAILED"
+                    const grpc::Status
+                        finish_status =
+                            finish_job(
+                                stub_ref,
+                                worker_id,
+                                job_id,
+                                succeeded
+                                    ? rpc::JOB_OUTCOME_SUCCEEDED
+                                    : rpc::JOB_OUTCOME_FAILED,
+                                &finish_response
+                            );
+
+                    if (!finish_status.ok()) {
+                        std::cerr
+                            << "Could not finish job "
+                            << job_id
+                            << " (gRPC code "
+                            << static_cast<int>(
+                                finish_status
+                                    .error_code()
+                            )
+                            << "): "
+                            << finish_status
+                                   .error_message()
+                            << '\n';
+                    } else {
+                        std::cout
+                            << "Job "
+                            << job_id
+                            << " completed with state "
+                            << (
+                                succeeded
+                                    ? "SUCCEEDED"
+                                    : "FAILED"
+                            )
+                            << '\n';
+                    }
+
+                    active_jobs.remove(job_id);
+                }
             )
-            << '\n';
-
-        break;
-    }
-
-        std::cout
-            << "No eligible job available; retrying...\n";
-
-        std::this_thread::sleep_for(
-            std::chrono::seconds{2}
         );
     }
+
+    std::cout
+        << "Shutdown requested; draining "
+        << running_jobs.size()
+        << " in-flight job(s)...\n";
+
+    for (auto& job_future : running_jobs) {
+        try {
+            job_future.get();
+        } catch (const std::exception& error) {
+            std::cerr
+                << "Job execution thread raised"
+                << " during drain: "
+                << error.what()
+                << '\n';
+        }
+    }
+
+    std::cout
+        << "All in-flight jobs finished;"
+        << " shutting down\n";
 
     return 0;
 }

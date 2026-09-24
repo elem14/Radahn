@@ -412,6 +412,48 @@ InMemoryCoordinator::mark_expired_job_leases(
 }
 
 std::size_t
+InMemoryCoordinator::renew_job_leases_for_worker(
+    const domain::WorkerId& worker_id,
+    const std::vector<domain::JobId>& active_job_ids,
+    persistence::JobLeaseTimePoint now
+) {
+    std::size_t renewed_count = 0;
+
+    for (const auto& job_id : active_job_ids) {
+        auto record = job_repository_.get(job_id);
+
+        if (!record.has_value()) {
+            continue;
+        }
+
+        if (
+            !record->assigned_worker_id.has_value() ||
+            *record->assigned_worker_id != worker_id
+        ) {
+            continue;
+        }
+
+        if (
+            record->job.state() !=
+            domain::JobState::running
+        ) {
+            continue;
+        }
+
+        record->lease_expires_at =
+            now + lease_duration_;
+
+        job_repository_.update(
+            std::move(*record)
+        );
+
+        ++renewed_count;
+    }
+
+    return renewed_count;
+}
+
+std::size_t
 InMemoryCoordinator::requeue_retry_wait_jobs() {
     auto records =
         job_repository_.list();

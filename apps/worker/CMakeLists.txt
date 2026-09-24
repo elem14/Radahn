@@ -2,6 +2,7 @@ add_executable(
     radahn-worker
     main.cpp
     heartbeat_loop.cpp
+    active_job_registry.cpp
 )
 
 target_link_libraries(

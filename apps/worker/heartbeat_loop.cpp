@@ -47,6 +47,7 @@ std::chrono::milliseconds validate_interval(
 HeartbeatLoop::HeartbeatLoop(
     std::string coordinator_address,
     std::string worker_id,
+    const ActiveJobRegistry& active_jobs,
     std::chrono::milliseconds interval
 )
     : stub_{
@@ -65,6 +66,7 @@ HeartbeatLoop::HeartbeatLoop(
               std::move(worker_id)
           )
       },
+      active_jobs_{active_jobs},
       interval_{
           validate_interval(interval)
       },
@@ -106,6 +108,15 @@ void HeartbeatLoop::run() {
         request.set_worker_id(
             worker_id_
         );
+
+        for (
+            const auto& job_id :
+            active_jobs_.snapshot()
+        ) {
+            request.add_active_job_ids(
+                job_id
+            );
+        }
 
         rpc::HeartbeatResponse response;
 

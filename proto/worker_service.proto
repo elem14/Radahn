@@ -49,6 +49,13 @@ message RegisterWorkerResponse {
 
 message HeartbeatRequest {
   string worker_id = 1;
+
+  // Job IDs the worker currently considers actively RUNNING on it.
+  // The coordinator renews the lease of each such job independently,
+  // so one stuck job does not keep other, healthy jobs alive by
+  // association, and does not itself get renewed by another job's
+  // heartbeat activity.
+  repeated string active_job_ids = 2;
 }
 
 message HeartbeatResponse {

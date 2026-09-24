@@ -454,6 +454,27 @@ add_test(
 )
 
 add_executable(
+    radahn-concurrent-job-execution-tests
+    unit/concurrent_job_execution_tests.cpp
+)
+
+target_link_libraries(
+    radahn-concurrent-job-execution-tests
+    PRIVATE
+        radahn_coordinator
+        radahn_persistence
+        radahn_scheduler
+        radahn_domain
+        radahn_project_options
+        radahn_project_warnings
+)
+
+add_test(
+    NAME radahn.concurrent_job_execution
+    COMMAND radahn-concurrent-job-execution-tests
+)
+
+add_executable(
     radahn-best-fit-policy-tests
     unit/best_fit_policy_tests.cpp
 )
