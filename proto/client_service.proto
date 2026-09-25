@@ -48,11 +48,19 @@ message ResourceRequirements {
 enum WorkloadKind {
   WORKLOAD_KIND_UNSPECIFIED = 0;
   WORKLOAD_KIND_SLEEP = 1;
+  WORKLOAD_KIND_COMMAND = 2;
+}
+
+message CommandWorkload {
+  string executable = 1;
+  repeated string args = 2;
+  optional uint64 timeout_ms = 3;
 }
 
 message WorkloadSpec {
   WorkloadKind kind = 1;
   uint64 sleep_duration_ms = 2;
+  CommandWorkload command = 3;
 }
 
 message JobInfo {

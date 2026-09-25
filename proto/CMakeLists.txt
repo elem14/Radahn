@@ -80,3 +80,26 @@ target_link_libraries(
         radahn_project_options
         radahn_project_warnings
 )
+
+add_library(
+    radahn_workload_codec
+    STATIC
+        workload_codec.cpp
+)
+
+target_include_directories(
+    radahn_workload_codec
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+target_link_libraries(
+    radahn_workload_codec
+    PUBLIC
+        radahn_domain
+        radahn_proto
+
+    PRIVATE
+        radahn_project_options
+        radahn_project_warnings
+)

@@ -9,7 +9,7 @@ namespace radahn::persistence {
 
 namespace {
 
-constexpr std::int64_t current_schema_version = 4;
+constexpr std::int64_t current_schema_version = 5;
 
 void create_latest_schema(
     SqliteDatabase& database
@@ -109,6 +109,30 @@ void create_latest_schema(
                 FOREIGN KEY (assigned_worker_id)
                     REFERENCES workers(worker_id)
                     ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS job_commands (
+                job_id TEXT PRIMARY KEY NOT NULL,
+                executable TEXT NOT NULL
+                    CHECK(length(executable) > 0),
+                timeout_ms INTEGER
+                    CHECK(timeout_ms > 0),
+                FOREIGN KEY (job_id)
+                    REFERENCES jobs(job_id)
+                    ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS job_command_args (
+                job_id TEXT NOT NULL,
+                position INTEGER NOT NULL
+                    CHECK(position >= 0),
+                argument TEXT NOT NULL,
+
+                PRIMARY KEY (job_id, position),
+
+                FOREIGN KEY (job_id)
+                    REFERENCES job_commands(job_id)
+                    ON DELETE CASCADE
             );
 
             CREATE TABLE IF NOT EXISTS job_required_tags (
@@ -228,6 +252,24 @@ void record_schema_migration(
                         * 1000
                     );
                 )sql"
+        );
+
+        return;
+    }
+
+    if (version == 5) {
+        database.execute(
+            R"sql(
+                INSERT OR IGNORE INTO schema_migrations (
+                    version,
+                    applied_at_unix_ms
+                )
+                VALUES (
+                    5,
+                    CAST(strftime('%s', 'now') AS INTEGER)
+                        * 1000
+                );
+            )sql"
         );
 
         return;
@@ -413,8 +455,13 @@ void initialize_sqlite_schema(
             );
         }
 
+        record_schema_migration(
+            database,
+            5
+        );
+
         database.execute(
-            "PRAGMA user_version = 4;"
+            "PRAGMA user_version = 5;"
         );
 
         database.execute(

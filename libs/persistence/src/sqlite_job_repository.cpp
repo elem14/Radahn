@@ -438,6 +438,268 @@ domain::JobState job_state_from_integer(
     }
 }
 
+void save_command(
+    sqlite3* database,
+    const JobRecord& record
+) {
+    const auto& job_id = record.job.id().value();
+
+    // Remove the previous command and its argument rows.
+    auto remove = prepare_statement(
+        database,
+        "DELETE FROM job_commands WHERE job_id = ?;"
+    );
+
+    bind_text(
+        database,
+        remove.get(),
+        1,
+        job_id,
+        "job_id"
+    );
+
+    if (sqlite3_step(remove.get()) != SQLITE_DONE) {
+        throw database_error(
+            database,
+            "Could not clear stored command"
+        );
+    }
+
+    if (
+        record.job.workload().kind() !=
+        domain::WorkloadKind::command
+    ) {
+        return;
+    }
+
+    const auto& command =
+        record.job.workload().command_spec();
+
+    auto statement = prepare_statement(
+        database,
+        R"sql(
+            INSERT INTO job_commands (
+                job_id,
+                executable,
+                timeout_ms
+            )
+            VALUES (?, ?, ?);
+        )sql"
+    );
+
+    bind_text(
+        database,
+        statement.get(),
+        1,
+        job_id,
+        "job_id"
+    );
+
+    bind_text(
+        database,
+        statement.get(),
+        2,
+        command.executable,
+        "executable"
+    );
+
+    if (command.timeout) {
+        bind_int64(
+            database,
+            statement.get(),
+            3,
+            command.timeout->count(),
+            "timeout_ms"
+        );
+    } else {
+        require_bind_success(
+            database,
+            sqlite3_bind_null(statement.get(), 3),
+            "timeout_ms"
+        );
+    }
+
+    if (sqlite3_step(statement.get()) != SQLITE_DONE) {
+        throw database_error(
+            database,
+            "Could not save command"
+        );
+    }
+
+    auto argument = prepare_statement(
+        database,
+        R"sql(
+            INSERT INTO job_command_args (
+                job_id,
+                position,
+                argument
+            )
+            VALUES (?, ?, ?);
+        )sql"
+    );
+
+    for (
+        std::size_t index = 0;
+        index < command.args.size();
+        ++index
+    ) {
+        sqlite3_reset(argument.get());
+        sqlite3_clear_bindings(argument.get());
+
+        bind_text(
+            database,
+            argument.get(),
+            1,
+            job_id,
+            "job_id"
+        );
+
+        bind_int64(
+            database,
+            argument.get(),
+            2,
+            checked_sql_integer(index, "position"),
+            "position"
+        );
+
+        bind_text(
+            database,
+            argument.get(),
+            3,
+            command.args[index],
+            "argument"
+        );
+
+        if (
+            sqlite3_step(argument.get()) !=
+            SQLITE_DONE
+        ) {
+            throw database_error(
+                database,
+                "Could not save command argument"
+            );
+        }
+    }
+}
+
+[[nodiscard]]
+domain::WorkloadSpec load_command(
+    sqlite3* database,
+    const std::string& job_id
+) {
+    auto statement = prepare_statement(
+        database,
+        R"sql(
+            SELECT executable, timeout_ms
+            FROM job_commands
+            WHERE job_id = ?;
+        )sql"
+    );
+
+    bind_text(
+        database,
+        statement.get(),
+        1,
+        job_id,
+        "job_id"
+    );
+
+    const int result = sqlite3_step(statement.get());
+
+    if (result == SQLITE_DONE) {
+        throw std::runtime_error{
+            "Command job is missing its stored specification"
+        };
+    }
+
+    if (result != SQLITE_ROW) {
+        throw database_error(
+            database,
+            "Could not load command"
+        );
+    }
+
+    domain::CommandWorkload command{
+        text_column(
+            statement.get(),
+            0,
+            "executable"
+        ),
+        {},
+        std::nullopt
+    };
+
+    if (
+        sqlite3_column_type(statement.get(), 1) !=
+        SQLITE_NULL
+    ) {
+        command.timeout = std::chrono::milliseconds{
+            sqlite3_column_int64(statement.get(), 1)
+        };
+    }
+
+    auto arguments = prepare_statement(
+        database,
+        R"sql(
+            SELECT position, argument
+            FROM job_command_args
+            WHERE job_id = ?
+            ORDER BY position;
+        )sql"
+    );
+
+    bind_text(
+        database,
+        arguments.get(),
+        1,
+        job_id,
+        "job_id"
+    );
+
+    while (true) {
+        const int argument_result =
+            sqlite3_step(arguments.get());
+
+        if (argument_result == SQLITE_DONE) {
+            break;
+        }
+
+        if (argument_result != SQLITE_ROW) {
+            throw database_error(
+                database,
+                "Could not load command arguments"
+            );
+        }
+
+        const auto expected_position =
+            checked_sql_integer(
+                command.args.size(),
+                "position"
+            );
+
+        if (
+            sqlite3_column_int64(arguments.get(), 0) !=
+            expected_position
+        ) {
+            throw std::runtime_error{
+                "Stored argument positions are not contiguous"
+            };
+        }
+
+        command.args.push_back(
+            text_column(
+                arguments.get(),
+                1,
+                "argument"
+            )
+        );
+    }
+
+    return domain::WorkloadSpec::command(
+        std::move(command)
+    );
+}
+
 [[nodiscard]]
 int workload_kind_to_integer(
     domain::WorkloadKind kind
@@ -445,6 +707,9 @@ int workload_kind_to_integer(
     switch (kind) {
         case domain::WorkloadKind::sleep:
             return 1;
+
+        case domain::WorkloadKind::command:
+            return 2;
     }
 
     throw std::invalid_argument{
@@ -454,10 +719,18 @@ int workload_kind_to_integer(
 
 [[nodiscard]]
 domain::WorkloadSpec workload_from_columns(
+    sqlite3* database,
+    const std::string& job_id,
     int workload_kind,
     std::uint64_t sleep_duration_ms
 ) {
     switch (workload_kind) {
+        case 2:
+            return load_command(
+                database,
+                job_id
+            );
+
         case 1: {
             using MillisecondsRep =
                 std::chrono::milliseconds::rep;
@@ -840,6 +1113,8 @@ persistence::JobRecord record_from_row(
 
     auto workload =
         workload_from_columns(
+            database,
+            job_id,
             workload_kind,
             sleep_duration_ms
         );
@@ -1119,6 +1394,11 @@ void SqliteJobRepository::insert(
             record
         );
 
+        save_command(
+            database,
+            record
+        );
+
         database_.execute(
             "COMMIT;"
         );
@@ -1353,6 +1633,11 @@ void SqliteJobRepository::update(
         );
 
         insert_required_tags(
+            database,
+            record
+        );
+
+        save_command(
             database,
             record
         );

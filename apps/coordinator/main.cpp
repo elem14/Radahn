@@ -28,6 +28,8 @@
 #include "radahn/persistence/sqlite_job_repository.hpp"
 #include "radahn/persistence/sqlite_worker_repository.hpp"
 
+#include "workload_codec.hpp"
+
 #include "radahn/domain/id.hpp"
 #include "radahn/domain/job.hpp"
 #include "radahn/domain/job_state.hpp"
@@ -86,23 +88,9 @@ void fill_workload_info(
     const domain::WorkloadSpec& workload,
     rpc::WorkloadSpec* output
 ) {
-    switch (workload.kind()) {
-        case domain::WorkloadKind::sleep:
-            output->set_kind(
-                rpc::WORKLOAD_KIND_SLEEP
-            );
-
-            output->set_sleep_duration_ms(
-                static_cast<std::uint64_t>(
-                    workload.sleep_duration().count()
-                )
-            );
-
-            return;
-    }
-
-    output->set_kind(
-        rpc::WORKLOAD_KIND_UNSPECIFIED
+    radahn::rpc_codec::encode_workload(
+        workload,
+        *output
     );
 }
 
@@ -223,48 +211,9 @@ copy_required_tags(
 [[nodiscard]] domain::WorkloadSpec copy_workload(
     const rpc::WorkloadSpec& workload
 ) {
-    switch (workload.kind()) {
-        case rpc::WORKLOAD_KIND_SLEEP: {
-            const std::uint64_t duration_ms =
-                workload.sleep_duration_ms();
-
-            if (duration_ms == 0) {
-                throw std::invalid_argument{
-                    "Sleep duration must be positive"
-                };
-            }
-
-            using MillisecondsRep =
-                std::chrono::milliseconds::rep;
-
-            const auto maximum_duration =
-                static_cast<std::uint64_t>(
-                    std::numeric_limits<
-                        MillisecondsRep
-                    >::max()
-                );
-
-            if (duration_ms > maximum_duration) {
-                throw std::invalid_argument{
-                    "Sleep duration is outside the supported range"
-                };
-            }
-
-            return domain::WorkloadSpec::sleep(
-                std::chrono::milliseconds{
-                    static_cast<MillisecondsRep>(
-                        duration_ms
-                    )
-                }
-            );
-        }
-
-        case rpc::WORKLOAD_KIND_UNSPECIFIED:
-        default:
-            throw std::invalid_argument{
-                "Unsupported or missing workload"
-            };
-    }
+    return radahn::rpc_codec::decode_workload(
+        workload
+    );
 }
 
 /*
@@ -418,6 +367,14 @@ public:
                 copy_workload(
                     request->workload()
                 );
+
+            //remove ocne command persistence and execution are ready
+            if (workload.kind() == domain::WorkloadKind::command) {
+                return grpc::Status{
+                    grpc::StatusCode::UNIMPLEMENTED,
+                    "Command workloads are not enabled yet"
+                };
+            }
 
             std::size_t max_attempts =
                 domain::Job::default_max_attempts;
@@ -1173,6 +1130,16 @@ int main(
     int argc,
     char* argv[]
 ) {
+    /*
+     * stdout is fully buffered (not line-buffered) whenever it's
+     * redirected to a file or pipe rather than a TTY, which is
+     * exactly the deployed case — logs would sit unflushed for an
+     * unbounded time, invisible to anything tailing the
+     * coordinator's log. Force every write to flush immediately.
+     */
+    std::cout << std::unitbuf;
+    std::cerr << std::unitbuf;
+
     if (argc > 2) {
         std::cerr
             << "Usage: radahn-coordinator"

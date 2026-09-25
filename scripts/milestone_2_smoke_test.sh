@@ -30,12 +30,18 @@ WORKER_LOG="${TEMP_DIRECTORY}/worker.log"
 FINAL_JOB_LOG="${TEMP_DIRECTORY}/final-job.log"
 
 COORDINATOR_PID=""
+WORKER_PID=""
 
 cleanup() {
     local exit_status=$?
 
     # Prevent the cleanup function from recursively invoking itself.
     trap - EXIT INT TERM
+
+    if [[ -n "${WORKER_PID}" ]]; then
+        kill "${WORKER_PID}" 2>/dev/null || true
+        wait "${WORKER_PID}" 2>/dev/null || true
+    fi
 
     if [[ -n "${COORDINATOR_PID}" ]]; then
         kill "${COORDINATOR_PID}" 2>/dev/null || true
@@ -190,23 +196,48 @@ echo "[6/7] Submitting and executing ${job_id}"
     --tag "${architecture_tag}" \
     >"${SUBMIT_LOG}" 2>&1
 
+#
+# Since Milestone 4F, radahn-worker is a persistent daemon (it can
+# run many jobs concurrently over its lifetime) rather than a
+# process that exits after its first job, so it is started in the
+# background here and stopped explicitly once the job succeeds —
+# via SIGTERM, exercising the same graceful-drain shutdown path a
+# production worker relies on.
 "${WORKER_BINARY}" \
     "${worker_id}" \
     localhost:50051 \
-    >"${WORKER_LOG}" 2>&1
+    >"${WORKER_LOG}" 2>&1 &
 
-echo
-echo "[7/7] Verifying final job state"
+WORKER_PID=$!
 
-"${CLI_BINARY}" job get "${job_id}" \
-    >"${FINAL_JOB_LOG}" 2>&1
+job_succeeded=false
 
-if ! grep -q "State: SUCCEEDED" \
-    "${FINAL_JOB_LOG}"
-then
+for attempt in {1..60}
+do
+    "${CLI_BINARY}" job get "${job_id}" \
+        >"${FINAL_JOB_LOG}" 2>&1
+
+    if grep -q "State: SUCCEEDED" \
+        "${FINAL_JOB_LOG}"
+    then
+        job_succeeded=true
+        break
+    fi
+
+    sleep 0.25
+done
+
+if [[ "${job_succeeded}" != true ]]; then
     echo "Job did not reach SUCCEEDED."
     exit 1
 fi
+
+kill -TERM "${WORKER_PID}"
+wait "${WORKER_PID}" 2>/dev/null || true
+WORKER_PID=""
+
+echo
+echo "[7/7] Verifying final job state"
 
 if ! grep -q "Job entered RUNNING state" \
     "${WORKER_LOG}"
@@ -229,7 +260,7 @@ then
     exit 1
 fi
 
-if ! grep -q "Job completed with state SUCCEEDED" \
+if ! grep -q "Job ${job_id} completed with state SUCCEEDED" \
     "${WORKER_LOG}"
 then
     echo "Worker did not report successful completion."

@@ -492,3 +492,57 @@ add_test(
     NAME radahn.best_fit_policy
     COMMAND radahn-best-fit-policy-tests
 )
+
+add_executable(
+    radahn-command-workload-tests
+    unit/command_workload_tests.cpp
+)
+
+target_link_libraries(
+    radahn-command-workload-tests
+    PRIVATE
+        radahn_domain
+        radahn_project_options
+        radahn_project_warnings
+)
+
+add_test(
+    NAME radahn.command_workload
+    COMMAND radahn-command-workload-tests
+)
+
+add_executable(
+    radahn-workload-codec-tests
+    unit/workload_codec_tests.cpp
+)
+
+target_link_libraries(
+    radahn-workload-codec-tests
+    PRIVATE
+        radahn_workload_codec
+        radahn_project_options
+        radahn_project_warnings
+)
+
+add_test(
+    NAME radahn.workload_codec
+    COMMAND radahn-workload-codec-tests
+)
+
+add_executable(
+    radahn-command-persistence-tests
+    unit/command_persistence_tests.cpp
+)
+
+target_link_libraries(
+    radahn-command-persistence-tests
+    PRIVATE
+        radahn_persistence
+        radahn_project_options
+        radahn_project_warnings
+)
+
+add_test(
+    NAME radahn.command_persistence
+    COMMAND radahn-command-persistence-tests
+)

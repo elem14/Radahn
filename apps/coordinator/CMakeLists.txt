@@ -8,6 +8,7 @@ target_link_libraries(
     PRIVATE
         radahn_coordinator
         radahn_proto
+        radahn_workload_codec
         radahn_project_options
         radahn_project_warnings
 )

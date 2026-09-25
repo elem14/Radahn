@@ -7,6 +7,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -46,11 +47,20 @@ extern "C" void handle_shutdown_signal(int) {
     );
 }
 
+/*
+ * Derived from cpu_cores (which may itself be an overridden,
+ * simulated value — see --cpu) rather than always reading real
+ * hardware, so a locally-simulated heterogeneous cluster gets a
+ * concurrency cap that scales with the resources it claims to have.
+ */
 [[nodiscard]] std::uint64_t
-default_max_concurrent_jobs() {
-    return std::min<std::uint64_t>(
-        detected_cpu_count(),
-        4ULL
+default_max_concurrent_jobs(double cpu_cores) {
+    return std::max<std::uint64_t>(
+        1ULL,
+        std::min<std::uint64_t>(
+            static_cast<std::uint64_t>(cpu_cores),
+            4ULL
+        )
     );
 }
 
@@ -105,6 +115,273 @@ default_worker_tags() {
     return tags;
 }
 
+[[nodiscard]] double parse_double(
+    std::string_view text,
+    std::string_view field_name
+) {
+    try {
+        std::size_t consumed = 0;
+
+        const double value = std::stod(
+            std::string{text},
+            &consumed
+        );
+
+        if (consumed != text.size()) {
+            throw std::invalid_argument{
+                "Trailing characters"
+            };
+        }
+
+        return value;
+    } catch (const std::exception&) {
+        throw std::invalid_argument{
+            std::string{field_name} +
+            " must be a valid number"
+        };
+    }
+}
+
+[[nodiscard]] std::uint64_t parse_mib(
+    std::string_view text,
+    std::string_view field_name
+) {
+    const double value =
+        parse_double(text, field_name);
+
+    if (value < 0.0) {
+        throw std::invalid_argument{
+            std::string{field_name} +
+            " cannot be negative"
+        };
+    }
+
+    return static_cast<std::uint64_t>(
+        value * 1024.0 * 1024.0
+    );
+}
+
+[[nodiscard]] std::uint64_t parse_positive_count(
+    std::string_view text,
+    std::string_view field_name
+) {
+    try {
+        std::size_t consumed = 0;
+
+        const long long value = std::stoll(
+            std::string{text},
+            &consumed
+        );
+
+        if (
+            consumed != text.size() ||
+            value <= 0
+        ) {
+            throw std::invalid_argument{
+                "Out of range"
+            };
+        }
+
+        return static_cast<std::uint64_t>(
+            value
+        );
+    } catch (const std::exception&) {
+        throw std::invalid_argument{
+            std::string{field_name} +
+            " must be a positive integer"
+        };
+    }
+}
+
+/*
+ * Everything needed to register with the coordinator and run the
+ * job execution loop. Defaults match real detected hardware, but
+ * every field can be overridden from the command line so a single
+ * physical machine can stand in for several differently-shaped
+ * workers (e.g. a simulated GPU worker, or a simulated large Linux
+ * box) when exercising heterogeneous-cluster scheduling locally.
+ */
+struct WorkerConfig {
+    std::string worker_id{"local-worker"};
+    std::string coordinator_address{
+        "localhost:50051"
+    };
+    double cpu_cores =
+        static_cast<double>(
+            detected_cpu_count()
+        );
+    std::uint64_t memory_bytes =
+        8ULL * gibibyte;
+    std::uint64_t disk_bytes =
+        50ULL * gibibyte;
+    bool gpu_available = false;
+    std::vector<std::string> tags =
+        default_worker_tags();
+    std::uint64_t max_concurrent_jobs =
+        default_max_concurrent_jobs(
+            cpu_cores
+        );
+};
+
+[[nodiscard]] WorkerConfig parse_worker_config(
+    int argc,
+    char* argv[]
+) {
+    WorkerConfig config;
+
+    bool tags_overridden = false;
+    bool cpu_overridden = false;
+    bool max_concurrent_jobs_overridden = false;
+
+    int positional_index = 0;
+
+    for (int index = 1; index < argc; ++index) {
+        const std::string_view argument{
+            argv[index]
+        };
+
+        if (argument == "--cpu") {
+            if (index + 1 >= argc) {
+                throw std::invalid_argument{
+                    "--cpu requires a value"
+                };
+            }
+
+            config.cpu_cores = parse_double(
+                argv[++index],
+                "cpu"
+            );
+
+            cpu_overridden = true;
+
+            continue;
+        }
+
+        if (argument == "--memory-mib") {
+            if (index + 1 >= argc) {
+                throw std::invalid_argument{
+                    "--memory-mib requires a value"
+                };
+            }
+
+            config.memory_bytes = parse_mib(
+                argv[++index],
+                "memory-mib"
+            );
+
+            continue;
+        }
+
+        if (argument == "--disk-mib") {
+            if (index + 1 >= argc) {
+                throw std::invalid_argument{
+                    "--disk-mib requires a value"
+                };
+            }
+
+            config.disk_bytes = parse_mib(
+                argv[++index],
+                "disk-mib"
+            );
+
+            continue;
+        }
+
+        if (argument == "--gpu") {
+            config.gpu_available = true;
+            continue;
+        }
+
+        if (argument == "--tag") {
+            if (index + 1 >= argc) {
+                throw std::invalid_argument{
+                    "--tag requires a value"
+                };
+            }
+
+            if (!tags_overridden) {
+                config.tags.clear();
+                tags_overridden = true;
+            }
+
+            config.tags.emplace_back(
+                argv[++index]
+            );
+
+            continue;
+        }
+
+        if (argument == "--max-concurrent-jobs") {
+            if (index + 1 >= argc) {
+                throw std::invalid_argument{
+                    "--max-concurrent-jobs requires a value"
+                };
+            }
+
+            config.max_concurrent_jobs =
+                parse_positive_count(
+                    argv[++index],
+                    "max-concurrent-jobs"
+                );
+
+            max_concurrent_jobs_overridden = true;
+
+            continue;
+        }
+
+        if (
+            !argument.empty() &&
+            argument.front() == '-'
+        ) {
+            throw std::invalid_argument{
+                "Unknown flag: " +
+                std::string{argument}
+            };
+        }
+
+        switch (positional_index) {
+            case 0:
+                config.worker_id = argument;
+                break;
+
+            case 1:
+                config.coordinator_address =
+                    argument;
+                break;
+
+            default:
+                throw std::invalid_argument{
+                    "Too many positional arguments"
+                };
+        }
+
+        ++positional_index;
+    }
+
+    if (
+        config.cpu_cores <= 0.0
+    ) {
+        throw std::invalid_argument{
+            "cpu must be positive"
+        };
+    }
+
+    /*
+     * max_concurrent_jobs has a default derived from cpu_cores at
+     * construction time, using the real detected hardware value.
+     * If --cpu was overridden but --max-concurrent-jobs was not,
+     * recompute the default from the overridden CPU count instead.
+     */
+    if (cpu_overridden && !max_concurrent_jobs_overridden) {
+        config.max_concurrent_jobs =
+            default_max_concurrent_jobs(
+                config.cpu_cores
+            );
+    }
+
+    return config;
+}
+
 void print_job(const rpc::JobInfo& job) {
     std::cout
         << "Acquired job\n"
@@ -137,55 +414,48 @@ make_stub(std::string address) {
 
 grpc::Status register_worker(
     rpc::WorkerService::Stub& stub,
-    const std::string& worker_id
+    const WorkerConfig& config
 ) {
-    const double cpu_cores =
-        static_cast<double>(
-            detected_cpu_count()
-        );
-
-    const std::uint64_t configured_memory =
-        8ULL * gibibyte;
-
-    const std::uint64_t configured_disk =
-        50ULL * gibibyte;
-
-    const std::uint64_t max_concurrent_jobs =
-        default_max_concurrent_jobs();
-
     rpc::RegisterWorkerRequest request;
 
-    request.set_worker_id(worker_id);
+    request.set_worker_id(config.worker_id);
     request.set_running_jobs(0);
     request.set_max_concurrent_jobs(
-        max_concurrent_jobs
+        config.max_concurrent_jobs
     );
 
     auto* resources =
         request.mutable_resources();
 
-    resources->set_total_cpu_cores(cpu_cores);
-    resources->set_available_cpu_cores(cpu_cores);
+    resources->set_total_cpu_cores(
+        config.cpu_cores
+    );
+
+    resources->set_available_cpu_cores(
+        config.cpu_cores
+    );
 
     resources->set_total_memory_bytes(
-        configured_memory
+        config.memory_bytes
     );
 
     resources->set_available_memory_bytes(
-        configured_memory
+        config.memory_bytes
     );
 
     resources->set_total_disk_bytes(
-        configured_disk
+        config.disk_bytes
     );
 
     resources->set_available_disk_bytes(
-        configured_disk
+        config.disk_bytes
     );
 
-    resources->set_gpu_available(false);
+    resources->set_gpu_available(
+        config.gpu_available
+    );
 
-    for (const auto& tag : default_worker_tags()) {
+    for (const auto& tag : config.tags) {
         request.add_tags(tag);
     }
 
@@ -360,24 +630,36 @@ bool execute_job(
 }  // namespace
 
 int main(int argc, char* argv[]) {
-    std::string worker_id{"local-worker"};
-    std::string coordinator_address{
-        "localhost:50051"
-    };
+    /*
+     * stdout is fully buffered (not line-buffered) whenever it's
+     * redirected to a file or pipe rather than a TTY, which is
+     * exactly the deployed case — logs would sit unflushed for an
+     * unbounded time, invisible to anything tailing the worker's
+     * log. Force every write to flush immediately instead.
+     */
+    std::cout << std::unitbuf;
+    std::cerr << std::unitbuf;
 
-    if (argc >= 2) {
-        worker_id = argv[1];
-    }
+    WorkerConfig config;
 
-    if (argc >= 3) {
-        coordinator_address = argv[2];
-    }
-
-    if (argc > 3) {
+    try {
+        config = parse_worker_config(
+            argc,
+            argv
+        );
+    } catch (const std::invalid_argument& error) {
         std::cerr
+            << error.what()
+            << '\n'
             << "Usage: radahn-worker"
             << " [worker-id]"
-            << " [coordinator-address]\n";
+            << " [coordinator-address]"
+            << " [--cpu <cores>]"
+            << " [--memory-mib <n>]"
+            << " [--disk-mib <n>]"
+            << " [--gpu]"
+            << " [--tag <tag>]..."
+            << " [--max-concurrent-jobs <n>]\n";
 
         return 1;
     }
@@ -387,20 +669,29 @@ int main(int argc, char* argv[]) {
         << radahn::domain::version()
         << '\n'
         << "Worker ID: "
-        << worker_id
+        << config.worker_id
         << '\n'
         << "Coordinator: "
-        << coordinator_address
+        << config.coordinator_address
+        << '\n'
+        << "CPU: "
+        << config.cpu_cores
+        << " cores, Memory: "
+        << config.memory_bytes / (1024ULL * 1024ULL)
+        << " MiB, Disk: "
+        << config.disk_bytes / (1024ULL * 1024ULL)
+        << " MiB, GPU: "
+        << (config.gpu_available ? "yes" : "no")
         << '\n';
 
     auto stub = make_stub(
-        coordinator_address
+        config.coordinator_address
     );
 
     const grpc::Status registration_status =
         register_worker(
             *stub,
-            worker_id
+            config
         );
 
     if (!registration_status.ok()) {
@@ -425,14 +716,14 @@ int main(int argc, char* argv[]) {
 
     radahn::worker_app::HeartbeatLoop
         heartbeat_loop{
-            coordinator_address,
-            worker_id,
+            config.coordinator_address,
+            config.worker_id,
             active_jobs,
             std::chrono::seconds{2}
         };
 
     const std::uint64_t max_concurrent_jobs =
-        default_max_concurrent_jobs();
+        config.max_concurrent_jobs;
 
     std::cout
         << "Worker ready; up to "
@@ -490,7 +781,7 @@ int main(int argc, char* argv[]) {
         const grpc::Status status =
             acquire_job(
                 *stub,
-                worker_id,
+                config.worker_id,
                 &response
             );
 
@@ -527,7 +818,7 @@ int main(int argc, char* argv[]) {
         const grpc::Status start_status =
             start_job(
                 *stub,
-                worker_id,
+                config.worker_id,
                 response.job().id(),
                 &start_response
             );
@@ -563,7 +854,7 @@ int main(int argc, char* argv[]) {
                 [
                     &stub_ref = *stub,
                     &active_jobs,
-                    worker_id,
+                    worker_id = config.worker_id,
                     job_id,
                     job_info
                 ]() {
