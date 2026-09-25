@@ -31,7 +31,8 @@ void print_usage() {
         << "  radahn ping [message]\n"
         << "  radahn job submit <id> <name> <priority>"
         << " <cpu> <memory-mib> <disk-mib>"
-        << " [--gpu] [--tag <tag>]... [--max-attempts <n>]\n"
+        << " [--gpu] [--tag <tag>]... [--max-attempts <n>]"
+        << " [-- <executable> [args...]]\n"
         << "  radahn job get <id>\n"
         << "  radahn job list\n"
         << "  radahn help\n";
@@ -197,6 +198,9 @@ void print_usage() {
         case rpc::WORKLOAD_KIND_UNSPECIFIED:
         default:
             return "UNSPECIFIED";
+        
+        case rpc::WORKLOAD_KIND_COMMAND:
+            return "COMMAND";
     }
 }
 
@@ -275,6 +279,17 @@ void print_job(
                 << job.workload()
                        .sleep_duration_ms()
                 << " ms";
+        }
+
+        if (
+            job.workload().kind() ==
+            rpc::WORKLOAD_KIND_COMMAND
+        ) {
+            std::cout
+                << " executable="
+                << job.workload().command().executable()
+                << " arguments="
+                << job.workload().command().args_size();
         }
 
         std::cout << '\n';
@@ -404,6 +419,8 @@ int run_submit_job(
 
         std::vector<std::string> tags;
 
+        int command_start = -1;
+
         for (
             int index = 9;
             index < argc;
@@ -412,6 +429,17 @@ int run_submit_job(
             const std::string_view argument{
                 argv[index]
             };
+
+            if (argument == "--") {
+                if (index + 1 >= argc) {
+                    throw std::invalid_argument{
+                        "-- requires an executable"
+                    };
+                }
+
+                command_start = index + 1;
+                break;
+            }
 
             if (argument == "--gpu") {
                 requires_gpu = true;
@@ -506,21 +534,40 @@ int run_submit_job(
         }
 
         /*
-         * Milestone 2E uses a built-in sleep workload.
-         *
          * Every job submitted by this CLI currently sleeps
          * for 10 seconds after a worker starts it.
          */
         auto* workload =
             request.mutable_workload();
 
-        workload->set_kind(
-            rpc::WORKLOAD_KIND_SLEEP
-        );
+        if (command_start >= 0) {
+            workload->set_kind(
+                rpc::WORKLOAD_KIND_COMMAND
+            );
 
-        workload->set_sleep_duration_ms(
-            default_sleep_duration_ms
-        );
+            auto* command =
+                workload->mutable_command();
+
+            command->set_executable(
+                argv[command_start]
+            );
+
+            for (
+                int index = command_start + 1;
+                index < argc;
+                ++index
+            ) {
+                command->add_args(argv[index]);
+            }
+        } else {
+            workload->set_kind(
+                rpc::WORKLOAD_KIND_SLEEP
+            );
+
+            workload->set_sleep_duration_ms(
+                default_sleep_duration_ms
+            );
+        }
 
         rpc::SubmitJobResponse response;
         grpc::ClientContext context;

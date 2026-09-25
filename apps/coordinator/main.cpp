@@ -368,11 +368,14 @@ public:
                     request->workload()
                 );
 
-            //remove ocne command persistence and execution are ready
-            if (workload.kind() == domain::WorkloadKind::command) {
+            if (
+                workload.kind() ==
+                    domain::WorkloadKind::command &&
+                workload.command_spec().timeout.has_value()
+            ) {
                 return grpc::Status{
                     grpc::StatusCode::UNIMPLEMENTED,
-                    "Command workloads are not enabled yet"
+                    "Command execution timeouts are not enabled yet"
                 };
             }
 

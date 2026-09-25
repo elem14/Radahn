@@ -546,3 +546,27 @@ add_test(
     NAME radahn.command_persistence
     COMMAND radahn-command-persistence-tests
 )
+
+add_executable(
+    radahn-command-executor-tests
+    unit/command_executor_tests.cpp
+)
+
+target_link_libraries(
+    radahn-command-executor-tests
+    PRIVATE
+        radahn_execution
+        radahn_project_options
+        radahn_project_warnings
+)
+
+add_test(
+    NAME radahn.command_executor
+    COMMAND radahn-command-executor-tests
+)
+
+set_tests_properties(
+    radahn.command_executor
+    PROPERTIES
+        TIMEOUT 20
+)

@@ -13,6 +13,13 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include <filesystem>
+#include <syncstream>
+
+#include <unistd.h>
+
+#include "radahn/execution/command_executor.hpp"
+#include "workload_codec.hpp"
 
 #include <grpcpp/grpcpp.h>
 
@@ -563,6 +570,91 @@ grpc::Status finish_job(
 }
 
 [[nodiscard]]
+std::filesystem::path next_command_output_directory() {
+    static std::atomic<std::uint64_t> sequence{0};
+
+    const auto root = std::filesystem::absolute(
+        "radahn-logs"
+    );
+
+    std::filesystem::create_directories(root);
+
+    const auto timestamp =
+        std::chrono::steady_clock::now()
+            .time_since_epoch()
+            .count();
+
+    return root / (
+        "execution-" +
+        std::to_string(::getpid()) +
+        "-" +
+        std::to_string(timestamp) +
+        "-" +
+        std::to_string(
+            sequence.fetch_add(
+                1,
+                std::memory_order_relaxed
+            )
+        )
+    );
+}
+
+[[nodiscard]]
+bool execute_command_job(
+    const rpc::JobInfo& job
+) {
+    const auto workload =
+        radahn::rpc_codec::decode_workload(
+            job.workload()
+        );
+
+    const auto output_directory =
+        next_command_output_directory();
+
+    std::osyncstream(std::cout)
+        << "Command job " << job.id()
+        << " logs: " << output_directory.string()
+        << '\n';
+
+    const auto result =
+        radahn::execution::execute_command(
+            workload,
+            output_directory
+        );
+
+    std::osyncstream output{std::cout};
+
+    output
+        << "Command job " << job.id();
+
+    if (result.exit_code.has_value()) {
+        output
+            << " exited with code "
+            << *result.exit_code;
+    }
+
+    if (result.terminating_signal.has_value()) {
+        output
+            << " terminated by signal "
+            << *result.terminating_signal;
+    }
+
+    if (!result.diagnostic.empty()) {
+        output
+            << ": "
+            << result.diagnostic;
+    }
+
+    output
+        << "; result="
+        << (result.succeeded() ? "SUCCEEDED" : "FAILED")
+        << '\n';
+
+    return result.succeeded();
+}
+
+
+[[nodiscard]]
 bool execute_job(
     const rpc::JobInfo& job
 ) {
@@ -574,6 +666,9 @@ bool execute_job(
     }
 
     switch (job.workload().kind()) {
+        case rpc::WORKLOAD_KIND_COMMAND:
+            return execute_command_job(job);
+
         case rpc::WORKLOAD_KIND_SLEEP: {
             const std::uint64_t duration_ms =
                 job.workload().sleep_duration_ms();
@@ -606,6 +701,8 @@ bool execute_job(
                 << "Executing sleep workload for "
                 << duration_ms
                 << " ms\n";
+
+            
 
             std::this_thread::sleep_for(
                 std::chrono::milliseconds{
@@ -844,7 +941,7 @@ int main(int argc, char* argv[]) {
             response.job().id();
 
         const rpc::JobInfo job_info =
-            response.job();
+            start_response.job();
 
         active_jobs.add(job_id);
 
@@ -858,8 +955,17 @@ int main(int argc, char* argv[]) {
                     job_id,
                     job_info
                 ]() {
-                    const bool succeeded =
-                        execute_job(job_info);
+                    bool succeeded = false;
+
+                    try {
+                        succeeded = execute_job(job_info);
+                    } catch (const std::exception& error) {
+                        std::osyncstream(std::cerr)
+                            << "Job" << job_id
+                            << " execution error: "
+                            << error.what()
+                            << '\n';
+                    }
 
                     rpc::FinishJobResponse
                         finish_response;

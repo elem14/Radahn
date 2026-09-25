@@ -12,4 +12,6 @@ target_link_libraries(
         radahn_domain
         radahn_project_options
         radahn_project_warnings
+        radahn_execution
+        radahn_workload_codec
 )
