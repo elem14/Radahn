@@ -14,7 +14,8 @@
 #include <utility>
 #include <vector>
 #include <filesystem>
-#include <syncstream>
+#include <mutex>
+#include <sstream>
 
 #include <unistd.h>
 
@@ -31,6 +32,20 @@
 namespace {
 
 namespace rpc = radahn::rpc::v1;
+
+std::mutex g_log_mutex;
+
+void write_log(
+    std::ostream& destination,
+    const std::string& message
+) {
+    const std::lock_guard<std::mutex> lock{
+        g_log_mutex
+    };
+
+    destination << message << '\n';
+    destination.flush();
+}
 
 constexpr std::uint64_t gibibyte =
     1024ULL * 1024ULL * 1024ULL;
@@ -611,10 +626,11 @@ bool execute_command_job(
     const auto output_directory =
         next_command_output_directory();
 
-    std::osyncstream(std::cout)
-        << "Command job " << job.id()
-        << " logs: " << output_directory.string()
-        << '\n';
+    write_log(
+        std::cout,
+        "Command job " + job.id() +
+        " logs: " + output_directory.string()
+    );
 
     const auto result =
         radahn::execution::execute_command(
@@ -622,7 +638,7 @@ bool execute_command_job(
             output_directory
         );
 
-    std::osyncstream output{std::cout};
+    std::ostringstream output;
 
     output
         << "Command job " << job.id();
@@ -647,8 +663,12 @@ bool execute_command_job(
 
     output
         << "; result="
-        << (result.succeeded() ? "SUCCEEDED" : "FAILED")
-        << '\n';
+        << (result.succeeded() ? "SUCCEEDED" : "FAILED");
+
+    write_log(
+        std::cout,
+        output.str()
+    );
 
     return result.succeeded();
 }
@@ -960,11 +980,11 @@ int main(int argc, char* argv[]) {
                     try {
                         succeeded = execute_job(job_info);
                     } catch (const std::exception& error) {
-                        std::osyncstream(std::cerr)
-                            << "Job" << job_id
-                            << " execution error: "
-                            << error.what()
-                            << '\n';
+                        write_log(
+                            std::cerr,
+                            "Job " + job_id +
+                            " execution error: " + error.what()
+                        );
                     }
 
                     rpc::FinishJobResponse
