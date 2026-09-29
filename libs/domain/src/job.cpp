@@ -207,4 +207,35 @@ void Job::transition_to(
     state_ = next_state;
 }
 
+const std::optional<ExecutionResult>&
+Job::execution_result() const noexcept {
+    return execution_result_;
+}
+
+void Job::set_execution_result(
+    ExecutionResult result
+) {
+    result.validate();
+
+    if (
+        state_ != JobState::succeeded &&
+        state_ != JobState::failed
+    ) {
+        throw std::invalid_argument{
+            "Execution results require a succeeded or failed job"
+        };
+    }
+
+    const bool job_succeeded =
+        state_ == JobState::succeeded;
+
+    if (job_succeeded != result.succeeded()) {
+        throw std::invalid_argument{
+            "Execution result disagrees with terminal job state"
+        };
+    }
+
+    execution_result_ = std::move(result);
+}
+
 }  // namespace radahn::domain

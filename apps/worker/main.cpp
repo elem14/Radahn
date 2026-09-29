@@ -562,6 +562,7 @@ grpc::Status finish_job(
     const std::string& worker_id,
     const std::string& job_id,
     rpc::JobOutcome outcome,
+    const radahn::domain::ExecutionResult& result,
     rpc::FinishJobResponse* response
 ) {
     rpc::FinishJobRequest request;
@@ -569,6 +570,11 @@ grpc::Status finish_job(
     request.set_worker_id(worker_id);
     request.set_job_id(job_id);
     request.set_outcome(outcome);
+
+    radahn::rpc_codec::encode_execution_result(
+        result,
+        *request.mutable_execution_result()
+    );
 
     grpc::ClientContext context;
 
@@ -615,7 +621,7 @@ std::filesystem::path next_command_output_directory() {
 }
 
 [[nodiscard]]
-bool execute_command_job(
+radahn::domain::ExecutionResult execute_command_job(
     const rpc::JobInfo& job
 ) {
     const auto workload =
@@ -670,78 +676,53 @@ bool execute_command_job(
         output.str()
     );
 
-    return result.succeeded();
+    return result;
 }
 
 
 [[nodiscard]]
-bool execute_job(
+radahn::domain::ExecutionResult execute_job(
     const rpc::JobInfo& job
 ) {
     if (!job.has_workload()) {
-        std::cerr
-            << "Job does not contain a workload\n";
-
-        return false;
+        throw std::invalid_argument{
+            "Job does not contain a workload"
+        };
     }
 
-    switch (job.workload().kind()) {
-        case rpc::WORKLOAD_KIND_COMMAND:
-            return execute_command_job(job);
-
-        case rpc::WORKLOAD_KIND_SLEEP: {
-            const std::uint64_t duration_ms =
-                job.workload().sleep_duration_ms();
-
-            if (duration_ms == 0) {
-                std::cerr
-                    << "Sleep duration must be positive\n";
-
-                return false;
-            }
-
-            using MillisecondsRep =
-                std::chrono::milliseconds::rep;
-
-            const auto maximum_duration =
-                static_cast<std::uint64_t>(
-                    std::numeric_limits<
-                        MillisecondsRep
-                    >::max()
-                );
-
-            if (duration_ms > maximum_duration) {
-                std::cerr
-                    << "Sleep duration is too large\n";
-
-                return false;
-            }
-
-            std::cout
-                << "Executing sleep workload for "
-                << duration_ms
-                << " ms\n";
-
-            
-
-            std::this_thread::sleep_for(
-                std::chrono::milliseconds{
-                    static_cast<MillisecondsRep>(
-                        duration_ms
-                    )
-                }
-            );
-
-            return true;
-        }
-
-        case rpc::WORKLOAD_KIND_UNSPECIFIED:
-        default:
-            std::cerr
-                << "Unsupported workload type\n";
-
-            return false;
+    if (
+        job.workload().kind() ==
+        rpc::WORKLOAD_KIND_COMMAND
+    ) {
+        return execute_command_job(job);
     }
+
+    const auto workload =
+        radahn::rpc_codec::decode_workload(
+            job.workload()
+        );
+
+    if (
+        workload.kind() !=
+        radahn::domain::WorkloadKind::sleep
+    ) {
+        throw std::invalid_argument{
+            "Unsupported workload type"
+        };
+    }
+
+    std::this_thread::sleep_for(
+        workload.sleep_duration()
+    );
+
+    // Sleep is an internal workload, not a subprocess
+    // Its successful completion is represented as exit code 0
+    return radahn::domain::ExecutionResult{
+        radahn::domain::ExecutionOutcome::exited,
+        0,
+        std::nullopt,
+        {}
+    };
 }
 
 }  // namespace
@@ -975,17 +956,32 @@ int main(int argc, char* argv[]) {
                     job_id,
                     job_info
                 ]() {
-                    bool succeeded = false;
+
+                    radahn::domain::ExecutionResult result{
+                        radahn::domain::ExecutionOutcome::worker_error,
+                        std::nullopt,
+                        std::nullopt,
+                        "Execution did not complete"
+                    };
 
                     try {
-                        succeeded = execute_job(job_info);
+                        result = execute_job(job_info);
                     } catch (const std::exception& error) {
+                        result = radahn::domain::ExecutionResult{
+                            radahn::domain::ExecutionOutcome::worker_error,
+                            std::nullopt,
+                            std::nullopt,
+                            error.what()
+                        };
+
                         write_log(
                             std::cerr,
                             "Job " + job_id +
                             " execution error: " + error.what()
                         );
                     }
+
+                    const bool succeeded = result.succeeded();
 
                     rpc::FinishJobResponse
                         finish_response;
@@ -999,6 +995,7 @@ int main(int argc, char* argv[]) {
                                 succeeded
                                     ? rpc::JOB_OUTCOME_SUCCEEDED
                                     : rpc::JOB_OUTCOME_FAILED,
+                                result,
                                 &finish_response
                             );
 

@@ -438,6 +438,189 @@ domain::JobState job_state_from_integer(
     }
 }
 
+void save_execution_result(
+    sqlite3* database,
+    const JobRecord& record
+) {
+    const auto& id = record.job.id().value();
+
+    auto remove = prepare_statement(
+        database,
+        "DELETE FROM job_execution_results WHERE job_id = ?;"
+    );
+
+    bind_text(database, remove.get(), 1, id, "job_id");
+
+    if (sqlite3_step(remove.get()) != SQLITE_DONE) {
+        throw database_error(
+            database,
+            "Could not clear execution result"
+        );
+    }
+
+    const auto& stored = record.job.execution_result();
+
+    if (!stored.has_value()) {
+        return;
+    }
+
+    stored->validate();
+
+    auto statement = prepare_statement(
+        database,
+        R"sql(
+            INSERT INTO job_execution_results (
+                job_id,
+                outcome,
+                exit_code,
+                terminating_signal,
+                diagnostic
+            )
+            VALUES (?, ?, ?, ?, ?);
+        )sql"
+    );
+
+    bind_text(database, statement.get(), 1, id, "job_id");
+
+    bind_int64(
+        database,
+        statement.get(),
+        2,
+        static_cast<int>(stored->outcome),
+        "outcome"
+    );
+
+    if (stored->exit_code.has_value()) {
+        bind_int64(
+            database,
+            statement.get(),
+            3,
+            *stored->exit_code,
+            "exit_code"
+        );
+    } else {
+        require_bind_success(
+            database,
+            sqlite3_bind_null(statement.get(), 3),
+            "exit_code"
+        );
+    }
+
+    if (stored->terminating_signal.has_value()) {
+        bind_int64(
+            database,
+            statement.get(),
+            4,
+            *stored->terminating_signal,
+            "terminating_signal"
+        );
+    } else {
+        require_bind_success(
+            database,
+            sqlite3_bind_null(statement.get(), 4),
+            "terminating_signal"
+        );
+    }
+
+    bind_text(
+        database,
+        statement.get(),
+        5,
+        stored->diagnostic,
+        "diagnostic"
+    );
+
+    if (sqlite3_step(statement.get()) != SQLITE_DONE) {
+        throw database_error(
+            database,
+            "Could not save execution result"
+        );
+    }
+}
+
+[[nodiscard]]
+std::optional<domain::ExecutionResult>
+load_execution_result(
+    sqlite3* database,
+    const std::string& job_id
+) {
+    auto statement = prepare_statement(
+        database,
+        R"sql(
+            SELECT
+                outcome,
+                exit_code,
+                terminating_signal,
+                diagnostic
+            FROM job_execution_results
+            WHERE job_id = ?;
+        )sql"
+    );
+
+    bind_text(
+        database,
+        statement.get(),
+        1,
+        job_id,
+        "job_id"
+    );
+
+    const int step = sqlite3_step(statement.get());
+
+    if (step == SQLITE_DONE) {
+        return std::nullopt;
+    }
+
+    if (step != SQLITE_ROW) {
+        throw database_error(
+            database,
+            "Could not load execution result"
+        );
+    }
+
+    const auto* diagnostic =
+        sqlite3_column_text(statement.get(), 3);
+
+    if (diagnostic == nullptr) {
+        throw std::runtime_error{
+            "Stored diagnostic unexpectedly contains NULL"
+        };
+    }
+
+    domain::ExecutionResult result{
+        static_cast<domain::ExecutionOutcome>(
+            sqlite3_column_int(statement.get(), 0)
+        ),
+        std::nullopt,
+        std::nullopt,
+        std::string{
+            reinterpret_cast<const char*>(diagnostic),
+            static_cast<std::size_t>(
+                sqlite3_column_bytes(statement.get(), 3)
+            )
+        }
+    };
+
+    if (
+        sqlite3_column_type(statement.get(), 1) !=
+        SQLITE_NULL
+    ) {
+        result.exit_code =
+            sqlite3_column_int(statement.get(), 1);
+    }
+
+    if (
+        sqlite3_column_type(statement.get(), 2) !=
+        SQLITE_NULL
+    ) {
+        result.terminating_signal =
+            sqlite3_column_int(statement.get(), 2);
+    }
+
+    result.validate();
+    return result;
+}
+
 void save_command(
     sqlite3* database,
     const JobRecord& record
@@ -1148,6 +1331,17 @@ persistence::JobRecord record_from_row(
                 stored_max_attempts
             )
         );
+    
+    auto result = load_execution_result(
+        database,
+        job_id
+    );
+
+    if (result.has_value()) {
+        job.set_execution_result(
+            std::move(*result)
+        );
+    }
 
     return persistence::JobRecord{
         std::move(job),
@@ -1399,6 +1593,11 @@ void SqliteJobRepository::insert(
             record
         );
 
+        save_execution_result(
+            database,
+            record
+        );
+
         database_.execute(
             "COMMIT;"
         );
@@ -1638,6 +1837,11 @@ void SqliteJobRepository::update(
         );
 
         save_command(
+            database,
+            record
+        );
+
+        save_execution_result(
             database,
             record
         );

@@ -179,6 +179,15 @@ void fill_job_info(
             job.max_attempts()
         )
     );
+
+    output->clear_execution_result();
+
+    if (job.execution_result().has_value()) {
+        radahn::rpc_codec::encode_execution_result(
+            *job.execution_result(),
+            *output->mutable_execution_result()
+        );
+    }
 }
 
 /*
@@ -939,16 +948,27 @@ public:
                     };
                 }
 
+                std::optional<domain::ExecutionResult> result;
+
+                if (request->has_execution_result()) {
+                    result =
+                        radahn::rpc_codec::decode_execution_result(
+                            request->execution_result()
+                        );
+                }
+
                 switch (request->outcome()) {
                     case rpc::JOB_OUTCOME_SUCCEEDED:
                         coordinator_.mark_succeeded(
-                            job_id
+                            job_id,
+                            result
                         );
                         break;
 
                     case rpc::JOB_OUTCOME_FAILED:
                         coordinator_.mark_failed(
-                            job_id
+                            job_id,
+                            result
                         );
                         break;
 

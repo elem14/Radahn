@@ -3,6 +3,9 @@
 #include <chrono>
 #include <string>
 #include <cstddef>
+#include <optional>
+
+#include <radahn/domain/execution_result.hpp>
 
 #include "radahn/domain/id.hpp"
 #include "radahn/domain/job_state.hpp"
@@ -99,6 +102,14 @@ public:
 
     void transition_to(JobState next_state);
 
+    [[nodiscard]]
+    const std::optional<ExecutionResult>&
+    execution_result() const noexcept;
+
+    void set_execution_result(
+        ExecutionResult result
+    );
+
 private:
     Job(
         JobId id,
@@ -118,6 +129,8 @@ private:
 
     ResourceRequirements requirements_;
     WorkloadSpec workload_;
+
+    std::optional<ExecutionResult> execution_result_;
 
     JobState state_;
     TimePoint created_at_;

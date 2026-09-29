@@ -570,3 +570,22 @@ set_tests_properties(
     PROPERTIES
         TIMEOUT 20
 )
+
+add_executable(
+    radahn-execution-result-tests
+    unit/execution_result_tests.cpp
+)
+
+target_link_libraries(
+    radahn-execution-result-tests
+    PRIVATE
+        radahn_persistence
+        radahn_workload_codec
+        radahn_project_options
+        radahn_project_warnings
+)
+
+add_test(
+    NAME radahn.execution_result
+    COMMAND radahn-execution-result-tests
+)

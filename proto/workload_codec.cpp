@@ -157,4 +157,57 @@ domain::WorkloadSpec decode_workload(
     }
 }
 
+
+void encode_execution_result(
+    const domain::ExecutionResult& result,
+    rpc::v1::ExecutionResult& output
+) {
+    result.validate();
+    output.Clear();
+
+    // Values intentionally match the stable domain enum.
+    output.set_outcome(
+        static_cast<rpc::v1::ExecutionOutcome>(
+            static_cast<int>(result.outcome)
+        )
+    );
+
+    if (result.exit_code.has_value()) {
+        output.set_exit_code(*result.exit_code);
+    }
+
+    if (result.terminating_signal.has_value()) {
+        output.set_terminating_signal(
+            *result.terminating_signal
+        );
+    }
+
+    output.set_diagnostic(result.diagnostic);
+}
+
+domain::ExecutionResult decode_execution_result(
+    const rpc::v1::ExecutionResult& input
+) {
+    domain::ExecutionResult result{
+        static_cast<domain::ExecutionOutcome>(
+            static_cast<int>(input.outcome())
+        ),
+        std::nullopt,
+        std::nullopt,
+        input.diagnostic()
+    };
+
+    if (input.has_exit_code()) {
+        result.exit_code = input.exit_code();
+    }
+
+    if (input.has_terminating_signal()) {
+        result.terminating_signal =
+            input.terminating_signal();
+    }
+
+    result.validate();
+    return result;
+}
+
 }  // namespace radahn::rpc_codec

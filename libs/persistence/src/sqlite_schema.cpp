@@ -9,7 +9,7 @@ namespace radahn::persistence {
 
 namespace {
 
-constexpr std::int64_t current_schema_version = 5;
+constexpr std::int64_t current_schema_version = 6;
 
 void create_latest_schema(
     SqliteDatabase& database
@@ -109,6 +109,48 @@ void create_latest_schema(
                 FOREIGN KEY (assigned_worker_id)
                     REFERENCES workers(worker_id)
                     ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS job_execution_results (
+                job_id TEXT PRIMARY KEY NOT NULL,
+
+                outcome INTEGER NOT NULL
+                    CHECK(outcome IN (1, 2, 3, 4)),
+
+                exit_code INTEGER
+                    CHECK(exit_code BETWEEN 0 AND 255),
+
+                terminating_signal INTEGER
+                    CHECK(
+                        terminating_signal > 0 AND
+                        terminating_signal <= 2147483647
+                    ),
+
+                diagnostic TEXT NOT NULL,
+
+                CHECK(
+                    (
+                        outcome = 1 AND
+                        exit_code IS NOT NULL AND
+                        terminating_signal IS NULL
+                    )
+                    OR
+                    (
+                        outcome = 2 AND
+                        exit_code IS NULL AND
+                        terminating_signal IS NOT NULL
+                    )
+                    OR
+                    (
+                        outcome IN (3, 4) AND
+                        exit_code IS NULL AND
+                        terminating_signal IS NULL
+                    )
+                ),
+
+                FOREIGN KEY (job_id)
+                    REFERENCES jobs(job_id)
+                    ON DELETE CASCADE
             );
 
             CREATE TABLE IF NOT EXISTS job_commands (
@@ -266,6 +308,24 @@ void record_schema_migration(
                 )
                 VALUES (
                     5,
+                    CAST(strftime('%s', 'now') AS INTEGER)
+                        * 1000
+                );
+            )sql"
+        );
+
+        return;
+    }
+
+    if (version == 6) {
+        database.execute(
+            R"sql(
+                INSERT OR IGNORE INTO schema_migrations (
+                    version,
+                    applied_at_unix_ms
+                )
+                VALUES (
+                    6,
                     CAST(strftime('%s', 'now') AS INTEGER)
                         * 1000
                 );
@@ -460,8 +520,10 @@ void initialize_sqlite_schema(
             5
         );
 
+        record_schema_migration(database, 6);
+
         database.execute(
-            "PRAGMA user_version = 5;"
+            "PRAGMA user_version = 6;"
         );
 
         database.execute(

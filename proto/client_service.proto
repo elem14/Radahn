@@ -63,6 +63,21 @@ message WorkloadSpec {
   CommandWorkload command = 3;
 }
 
+enum ExecutionOutcome {
+  EXECUTION_OUTCOME_UNSPECIFIED = 0;
+  EXECUTION_OUTCOME_EXITED = 1;
+  EXECUTION_OUTCOME_SIGNALED = 2;
+  EXECUTION_OUTCOME_SPAWN_FAILED = 3;
+  EXECUTION_OUTCOME_WORKER_ERROR = 4;
+}
+
+message ExecutionResult {
+  ExecutionOutcome outcome = 1;
+  optional int32 exit_code = 2;
+  optional int32 terminating_signal = 3;
+  string diagnostic = 4;
+}
+
 message JobInfo {
   string id = 1;
   string name = 2;
@@ -73,6 +88,7 @@ message JobInfo {
   WorkloadSpec workload = 7;
   uint64 attempt_count = 8;
   uint64 max_attempts = 9;
+  ExecutionResult execution_result = 10;
 }
 
 message SubmitJobRequest {

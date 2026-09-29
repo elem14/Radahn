@@ -204,6 +204,28 @@ void print_usage() {
     }
 }
 
+[[nodiscard]]
+std::string_view execution_outcome_name(
+    rpc::ExecutionOutcome outcome
+) noexcept {
+    switch (outcome) {
+        case rpc::EXECUTION_OUTCOME_EXITED:
+            return "EXITED";
+
+        case rpc::EXECUTION_OUTCOME_SIGNALED:
+            return "SIGNALED";
+
+        case rpc::EXECUTION_OUTCOME_SPAWN_FAILED:
+            return "SPAWN_FAILED";
+
+        case rpc::EXECUTION_OUTCOME_WORKER_ERROR:
+            return "WORKER_ERROR";
+
+        default:
+            return "UNSPECIFIED";
+    }
+}
+
 void print_job(
     const rpc::JobInfo& job
 ) {
@@ -304,6 +326,40 @@ void print_job(
         << " / "
         << job.max_attempts()
         << '\n';
+
+        
+    if (job.has_execution_result()) {
+        const auto& result = job.execution_result();
+
+        std::cout
+            << "  Execution outcome: "
+            << execution_outcome_name(result.outcome())
+            << '\n';
+
+        if (result.has_exit_code()) {
+            std::cout
+                << "  Exit code: "
+                << result.exit_code()
+                << '\n';
+        }
+
+        if (result.has_terminating_signal()) {
+            std::cout
+                << "  Terminating signal: "
+                << result.terminating_signal()
+                << '\n';
+        }
+
+        if (!result.diagnostic().empty()) {
+            std::cout
+                << "  Diagnostic: "
+                << result.diagnostic()
+                << '\n';
+        }
+    } else {
+        std::cout
+            << "  Execution result: not recorded\n";
+    }
 }
 
 [[nodiscard]]

@@ -313,11 +313,12 @@ void test_version_four_migration() {
         // reconstructs the version 4 schema for this fixture.
         database.execute(
             R"sql(
+                DROP TABLE job_execution_results;
                 DROP TABLE job_command_args;
                 DROP TABLE job_commands;
 
                 DELETE FROM schema_migrations
-                WHERE version = 5;
+                WHERE version >= 5;
 
                 PRAGMA user_version = 4;
             )sql"
@@ -335,16 +336,16 @@ void test_version_four_migration() {
         require(
             database.query_int64(
                 "PRAGMA user_version;"
-            ) == 5,
-            "Version 4 database upgrades to version 5"
+            ) == 6,
+            "Version 5 database upgrades to version 6"
         );
 
         require(
             database.query_int64(
                 "SELECT COUNT(*) FROM schema_migrations "
-                "WHERE version = 5;"
+                "WHERE version = 6;"
             ) == 1,
-            "Repeated initialization records migration once"
+            "Execution-result migration is recorded once"
         );
 
         persistence::SqliteJobRepository repository{

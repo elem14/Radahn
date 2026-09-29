@@ -90,6 +90,7 @@ message FinishJobRequest {
   string worker_id = 1;
   string job_id = 2;
   JobOutcome outcome = 3;
+  ExecutionResult execution_result = 4;
 }
 
 message FinishJobResponse {

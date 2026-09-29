@@ -663,20 +663,24 @@ void InMemoryCoordinator::mark_running(
 }
 
 void InMemoryCoordinator::mark_succeeded(
-    const domain::JobId& job_id
+    const domain::JobId& job_id,
+    std::optional<domain::ExecutionResult> result
 ) {
     finish_job(
         job_id,
-        domain::JobState::succeeded
+        domain::JobState::succeeded,
+        std::move(result)
     );
 }
 
 void InMemoryCoordinator::mark_failed(
-    const domain::JobId& job_id
+    const domain::JobId& job_id,
+    std::optional<domain::ExecutionResult> result
 ) {
     finish_job(
         job_id,
-        domain::JobState::failed
+        domain::JobState::failed,
+        std::move(result)
     );
 }
 
@@ -1041,7 +1045,8 @@ void InMemoryCoordinator::apply_dispatch_decision(
 
 void InMemoryCoordinator::finish_job(
     const domain::JobId& job_id,
-    domain::JobState terminal_state
+    domain::JobState terminal_state,
+    std::optional<domain::ExecutionResult> result
 ) {
     auto record =
         job_repository_.get(
@@ -1097,6 +1102,12 @@ void InMemoryCoordinator::finish_job(
         record->job.transition_to(
             terminal_state
         );
+
+        if (result.has_value()) {
+            record->job.set_execution_result(
+                std::move(*result)
+            );
+        }
 
         record->lease_expires_at.reset();
 

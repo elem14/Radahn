@@ -39,9 +39,6 @@ public:
 
     /*
      * Dependency-injected constructor.
-     *
-     * This is the important Milestone 3A constructor. It lets the
-     * caller decide which repository implementations are used.
      */
     InMemoryCoordinator(
         scheduler::ISchedulingPolicy& policy,
@@ -117,11 +114,14 @@ public:
     );
 
     void mark_succeeded(
-        const domain::JobId& job_id
+        const domain::JobId& job_id,
+        std::optional<domain::ExecutionResult> result = 
+            std::nullopt
     );
 
     void mark_failed(
-        const domain::JobId& job_id
+        const domain::JobId& job_id,
+        std::optional<domain::ExecutionResult> result = std::nullopt
     );
 
     [[nodiscard]]
@@ -189,7 +189,8 @@ private:
 
     void finish_job(
         const domain::JobId& job_id,
-        domain::JobState terminal_state
+        domain::JobState terminal_state,
+        std::optional<domain::ExecutionResult> result
     );
 
     void recover_persisted_state();
