@@ -327,7 +327,6 @@ void print_job(
         << job.max_attempts()
         << '\n';
 
-        
     if (job.has_execution_result()) {
         const auto& result = job.execution_result();
 

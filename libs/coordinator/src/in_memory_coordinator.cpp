@@ -627,6 +627,155 @@ InMemoryCoordinator::dispatch_once_for_worker(
     return decision;
 }
 
+bool InMemoryCoordinator::start_job_attempt(
+    const domain::WorkerId& worker_id,
+    const JobAttempt& attempt,
+    persistence::JobLeaseTimePoint now
+) {
+    auto record = job_repository_.get(attempt.job_id);
+
+    if (
+        !record.has_value() ||
+        attempt.attempt_number == 0 ||
+        record->job.attempt_count() != attempt.attempt_number ||
+        !record->assigned_worker_id.has_value() ||
+        *record->assigned_worker_id != worker_id
+    ) {
+        return false;
+    }
+
+    if (
+        !record->lease_expires_at.has_value() ||
+        *record->lease_expires_at <= now
+    ) {
+        return false;
+    }
+
+    // A retry of StartJob for the same live attempt is harmless.
+    if (record->job.state() == domain::JobState::running) {
+        return true;
+    }
+
+    if (record->job.state() != domain::JobState::leased) {
+        return false;
+    }
+
+    record->job.transition_to(domain::JobState::running);
+    record->lease_expires_at = now + lease_duration_;
+
+    job_repository_.update(std::move(*record));
+
+    return true;
+}
+
+bool InMemoryCoordinator::finish_job_attempt(
+    const domain::WorkerId& worker_id,
+    const JobAttempt& attempt,
+    const domain::ExecutionResult& result,
+    persistence::JobLeaseTimePoint now
+) {
+    result.validate();
+
+    auto record = job_repository_.get(attempt.job_id);
+
+    if (
+        !record.has_value() ||
+        attempt.attempt_number == 0 ||
+        record->job.attempt_count() != attempt.attempt_number ||
+        !record->assigned_worker_id.has_value() ||
+        *record->assigned_worker_id != worker_id
+    ) {
+        return false;
+    }
+
+    const auto terminal_state =
+        result.succeeded()
+            ? domain::JobState::succeeded
+            : domain::JobState::failed;
+
+    const auto state = record->job.state();
+
+    if (
+        state == domain::JobState::succeeded ||
+        state == domain::JobState::failed
+    ) {
+        const auto& stored = record->job.execution_result();
+
+        // A completion can be retried after its response is lost.
+        // Accept only an exact repeat of the stored result.
+        return
+            state == terminal_state &&
+            stored.has_value() &&
+            stored->outcome == result.outcome &&
+            stored->exit_code == result.exit_code &&
+            stored->terminating_signal == result.terminating_signal &&
+            stored->diagnostic == result.diagnostic;
+    }
+
+    if (
+        state != domain::JobState::running ||
+        !record->lease_expires_at.has_value() ||
+        *record->lease_expires_at <= now
+    ) {
+        return false;
+    }
+
+    finish_job(attempt.job_id, terminal_state, result);
+
+    return true;
+}
+
+std::size_t InMemoryCoordinator::renew_job_attempt_leases(
+    const domain::WorkerId& worker_id,
+    const std::vector<JobAttempt>& attempts,
+    persistence::JobLeaseTimePoint now
+) {
+    std::size_t renewed_count = 0;
+    std::vector<domain::JobId> renewed_job_ids;
+
+    for (const auto& attempt : attempts) {
+        auto record = job_repository_.get(attempt.job_id);
+
+        if (
+            !record.has_value() ||
+            attempt.attempt_number == 0 ||
+            record->job.attempt_count() != attempt.attempt_number ||
+            !record->assigned_worker_id.has_value() ||
+            *record->assigned_worker_id != worker_id ||
+            record->job.state() != domain::JobState::running ||
+            !record->lease_expires_at.has_value() ||
+            *record->lease_expires_at <= now
+        ) {
+            continue;
+        }
+
+        bool already_renewed = false;
+
+        for (const auto& job_id : renewed_job_ids) {
+            if (job_id == attempt.job_id) {
+                already_renewed = true;
+                break;
+            }
+        }
+
+        if (already_renewed) {
+            continue;
+        }
+
+        const auto new_expiration = now + lease_duration_;
+
+        if (new_expiration > *record->lease_expires_at) {
+            record->lease_expires_at = new_expiration;
+            job_repository_.update(std::move(*record));
+        }
+
+        renewed_job_ids.push_back(attempt.job_id);
+        ++renewed_count;
+    }
+
+    return renewed_count;
+}
+
 void InMemoryCoordinator::mark_running(
     const domain::JobId& job_id
 ) {

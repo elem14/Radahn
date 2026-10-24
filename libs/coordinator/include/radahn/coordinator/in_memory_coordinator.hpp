@@ -5,6 +5,7 @@
 #include <memory>
 #include <optional>
 #include <vector>
+#include <cstdint>
 
 #include "radahn/domain/id.hpp"
 #include "radahn/domain/job.hpp"
@@ -22,24 +23,20 @@
 
 namespace radahn::coordinator {
 
+struct JobAttempt {
+    domain::JobId job_id;
+    std::uint64_t attempt_number;
+};
+
 class InMemoryCoordinator {
 public:
-    /*
-     * Convenience constructor.
-     *
-     * This creates private in-memory repositories so existing
-     * tests and callers can continue constructing the coordinator
-     * with only a scheduling policy.
-     */
     explicit InMemoryCoordinator(
         scheduler::ISchedulingPolicy& policy,
         std::chrono::milliseconds lease_duration =
             std::chrono::seconds{15}
     );
 
-    /*
-     * Dependency-injected constructor.
-     */
+    // Dependency-injected constructor
     InMemoryCoordinator(
         scheduler::ISchedulingPolicy& policy,
         persistence::IJobRepository& job_repository,
@@ -72,23 +69,6 @@ public:
         persistence::JobLeaseTimePoint now
     );
 
-    /*
-     * Extend the lease of every job in active_job_ids that is
-     * currently RUNNING and assigned to worker_id.
-     *
-     * This lets a worker keep long-running jobs alive independently
-     * of one another: a job the worker no longer reports as active
-     * (crashed, hung, or simply not included) keeps its existing
-     * lease and can still expire on schedule, while jobs the worker
-     * confirms are still running never do.
-     *
-     * Job IDs that don't exist, aren't RUNNING, or aren't assigned
-     * to this worker are silently ignored — the worker's view of
-     * its own active jobs may be briefly stale relative to the
-     * coordinator's.
-     *
-     * Returns the number of leases actually renewed.
-     */
     [[nodiscard]]
     std::size_t renew_job_leases_for_worker(
         const domain::WorkerId& worker_id,
@@ -107,6 +87,28 @@ public:
     std::optional<scheduler::DispatchDecision>
     dispatch_once_for_worker(
         const domain::WorkerId& worker_id
+    );
+
+    [[nodiscard]]
+    bool start_job_attempt(
+        const domain::WorkerId& worker_id,
+        const JobAttempt& attempt,
+        persistence::JobLeaseTimePoint now
+    );
+
+    [[nodiscard]]
+    bool finish_job_attempt(
+        const domain::WorkerId& worker_id,
+        const JobAttempt& attempt,
+        const domain::ExecutionResult& result,
+        persistence::JobLeaseTimePoint now
+    );
+
+    [[nodiscard]]
+    std::size_t renew_job_attempt_leases(
+        const domain::WorkerId& worker_id,
+        const std::vector<JobAttempt>& attempts,
+        persistence::JobLeaseTimePoint now
     );
 
     void mark_running(

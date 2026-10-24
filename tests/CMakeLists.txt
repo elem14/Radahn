@@ -589,3 +589,21 @@ add_test(
     NAME radahn.execution_result
     COMMAND radahn-execution-result-tests
 )
+
+add_executable(
+    radahn-job-attempt-fencing-tests
+    unit/job_attempt_fencing_tests.cpp
+)
+
+target_link_libraries(
+    radahn-job-attempt-fencing-tests
+    PRIVATE
+        radahn_coordinator
+        radahn_project_options
+        radahn_project_warnings
+)
+
+add_test(
+    NAME radahn.job_attempt_fencing
+    COMMAND radahn-job-attempt-fencing-tests
+)
