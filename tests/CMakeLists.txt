@@ -607,3 +607,56 @@ add_test(
     NAME radahn.job_attempt_fencing
     COMMAND radahn-job-attempt-fencing-tests
 )
+
+add_executable(
+    radahn-active-job-registry-tests
+    unit/active_job_registry_tests.cpp
+    ${CMAKE_SOURCE_DIR}/apps/worker/active_job_registry.cpp
+)
+
+target_include_directories(
+    radahn-active-job-registry-tests
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/apps/worker
+)
+
+target_link_libraries(
+    radahn-active-job-registry-tests
+    PRIVATE
+        radahn_project_options
+        radahn_project_warnings
+)
+
+add_test(
+    NAME radahn.active_job_registry
+    COMMAND radahn-active-job-registry-tests
+)
+
+add_executable(
+    radahn-completion-reporter-tests
+    unit/completion_reporter_tests.cpp
+    ${CMAKE_SOURCE_DIR}/apps/worker/completion_reporter.cpp
+)
+
+target_include_directories(
+    radahn-completion-reporter-tests
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/apps/worker
+)
+
+target_link_libraries(
+    radahn-completion-reporter-tests
+    PRIVATE
+        radahn_coordinator
+        radahn_persistence
+        radahn_scheduler
+        radahn_domain
+        radahn_workload_codec
+        radahn_project_options
+        radahn_project_warnings
+)
+
+add_test(
+    NAME radahn.completion_reporter
+    COMMAND radahn-completion-reporter-tests
+)

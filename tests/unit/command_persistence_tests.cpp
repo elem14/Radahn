@@ -10,7 +10,9 @@
 #include <utility>
 #include <vector>
 
+#include "radahn/domain/execution_result.hpp"
 #include "radahn/domain/job.hpp"
+#include "radahn/domain/job_state.hpp"
 #include "radahn/domain/resource.hpp"
 #include "radahn/domain/workload.hpp"
 
@@ -336,8 +338,8 @@ void test_version_four_migration() {
         require(
             database.query_int64(
                 "PRAGMA user_version;"
-            ) == 6,
-            "Version 5 database upgrades to version 6"
+            ) == 7,
+            "Version 5 database upgrades to the current version"
         );
 
         require(
@@ -386,12 +388,206 @@ void test_version_four_migration() {
     }
 }
 
+void test_version_six_migration_expands_outcomes() {
+    TemporaryDatabase temporary;
+
+    {
+        persistence::SqliteDatabase database{
+            temporary.path
+        };
+
+        persistence::SqliteJobRepository repository{
+            database
+        };
+
+        domain::Job finished{
+            domain::JobId{"legacy-result"},
+            "Legacy outcome",
+            1,
+            domain::ResourceRequirements{
+                1.0, 1024, 1024, false, {}
+            },
+            domain::WorkloadSpec::sleep(10ms)
+        };
+
+        finished.transition_to(domain::JobState::leased);
+        finished.transition_to(domain::JobState::running);
+        finished.transition_to(domain::JobState::succeeded);
+
+        finished.set_execution_result(
+            domain::ExecutionResult{
+                domain::ExecutionOutcome::exited,
+                0,
+                std::nullopt,
+                ""
+            }
+        );
+
+        repository.insert(
+            persistence::JobRecord{
+                std::move(finished),
+                std::nullopt,
+                std::nullopt
+            }
+        );
+
+        /*
+         * Reconstruct the version-6 job_execution_results shape
+         * (outcome restricted to 1-4) under an otherwise current
+         * database, so the next open must migrate it forward.
+         */
+        database.execute(
+            R"sql(
+                CREATE TABLE job_execution_results_v6 (
+                    job_id TEXT PRIMARY KEY NOT NULL,
+
+                    outcome INTEGER NOT NULL
+                        CHECK(outcome IN (1, 2, 3, 4)),
+
+                    exit_code INTEGER
+                        CHECK(exit_code BETWEEN 0 AND 255),
+
+                    terminating_signal INTEGER
+                        CHECK(
+                            terminating_signal > 0 AND
+                            terminating_signal <= 2147483647
+                        ),
+
+                    diagnostic TEXT NOT NULL,
+
+                    CHECK(
+                        (
+                            outcome = 1 AND
+                            exit_code IS NOT NULL AND
+                            terminating_signal IS NULL
+                        )
+                        OR
+                        (
+                            outcome = 2 AND
+                            exit_code IS NULL AND
+                            terminating_signal IS NOT NULL
+                        )
+                        OR
+                        (
+                            outcome IN (3, 4) AND
+                            exit_code IS NULL AND
+                            terminating_signal IS NULL
+                        )
+                    ),
+
+                    FOREIGN KEY (job_id)
+                        REFERENCES jobs(job_id)
+                        ON DELETE CASCADE
+                );
+
+                INSERT INTO job_execution_results_v6
+                SELECT * FROM job_execution_results;
+
+                DROP TABLE job_execution_results;
+
+                ALTER TABLE job_execution_results_v6
+                    RENAME TO job_execution_results;
+
+                DELETE FROM schema_migrations
+                WHERE version >= 7;
+
+                PRAGMA user_version = 6;
+            )sql"
+        );
+    }
+
+    {
+        persistence::SqliteDatabase database{
+            temporary.path
+        };
+
+        persistence::initialize_sqlite_schema(database);
+        persistence::initialize_sqlite_schema(database);
+
+        require(
+            database.query_int64(
+                "PRAGMA user_version;"
+            ) == 7,
+            "Version 6 database upgrades to version 7"
+        );
+
+        require(
+            database.query_int64(
+                "SELECT COUNT(*) FROM schema_migrations "
+                "WHERE version = 7;"
+            ) == 1,
+            "Outcome-expansion migration is recorded once"
+        );
+
+        persistence::SqliteJobRepository repository{
+            database
+        };
+
+        const auto legacy = repository.get(
+            domain::JobId{"legacy-result"}
+        );
+
+        require(
+            legacy.has_value() &&
+            legacy->job.execution_result().has_value() &&
+            legacy->job.execution_result()->outcome ==
+                domain::ExecutionOutcome::exited &&
+            legacy->job.execution_result()->exit_code == 0,
+            "Migration preserves the existing execution result"
+        );
+
+        domain::Job timed_out{
+            domain::JobId{"new-timeout"},
+            "New outcome",
+            1,
+            domain::ResourceRequirements{
+                1.0, 1024, 1024, false, {}
+            },
+            domain::WorkloadSpec::sleep(10ms)
+        };
+
+        timed_out.transition_to(domain::JobState::leased);
+        timed_out.transition_to(domain::JobState::running);
+        timed_out.transition_to(domain::JobState::failed);
+
+        timed_out.set_execution_result(
+            domain::ExecutionResult{
+                domain::ExecutionOutcome::timed_out,
+                std::nullopt,
+                std::nullopt,
+                "Execution deadline exceeded"
+            }
+        );
+
+        repository.insert(
+            persistence::JobRecord{
+                std::move(timed_out),
+                std::nullopt,
+                std::nullopt
+            }
+        );
+
+        const auto stored = repository.get(
+            domain::JobId{"new-timeout"}
+        );
+
+        require(
+            stored.has_value() &&
+            stored->job.execution_result().has_value() &&
+            stored->job.execution_result()->outcome ==
+                domain::ExecutionOutcome::timed_out,
+            "Migrated database accepts the new TIMED_OUT outcome"
+        );
+    }
+}
+
 }  // namespace
 
 int main() {
     try {
         test_persistence();
         test_version_four_migration();
+        test_version_six_migration_expands_outcomes();
         return EXIT_SUCCESS;
     } catch (const std::exception& error) {
         std::cerr

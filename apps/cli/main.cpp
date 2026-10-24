@@ -2,6 +2,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -32,6 +33,7 @@ void print_usage() {
         << "  radahn job submit <id> <name> <priority>"
         << " <cpu> <memory-mib> <disk-mib>"
         << " [--gpu] [--tag <tag>]... [--max-attempts <n>]"
+        << " [--timeout-ms <n>]"
         << " [-- <executable> [args...]]\n"
         << "  radahn job get <id>\n"
         << "  radahn job list\n"
@@ -154,6 +156,56 @@ void print_usage() {
     }
 }
 
+[[nodiscard]] std::uint64_t parse_positive_uint64(
+    std::string_view text,
+    std::string_view field_name
+) {
+    if (
+        text.empty() ||
+        text.front() == '-'
+    ) {
+        throw std::invalid_argument{
+            std::string{field_name} +
+            " must be a positive integer"
+        };
+    }
+
+    try {
+        std::size_t consumed = 0;
+
+        const unsigned long long value =
+            std::stoull(
+                std::string{text},
+                &consumed
+            );
+
+        if (
+            consumed != text.size() ||
+            value == 0
+        ) {
+            throw std::invalid_argument{
+                "Out of range"
+            };
+        }
+
+        if (
+            value >
+            std::numeric_limits<std::uint64_t>::max()
+        ) {
+            throw std::out_of_range{
+                "Value is too large"
+            };
+        }
+
+        return static_cast<std::uint64_t>(value);
+    } catch (const std::exception&) {
+        throw std::invalid_argument{
+            std::string{field_name} +
+            " must be a positive integer"
+        };
+    }
+}
+
 [[nodiscard]] std::string_view state_name(
     rpc::JobState state
 ) noexcept {
@@ -220,6 +272,12 @@ std::string_view execution_outcome_name(
 
         case rpc::EXECUTION_OUTCOME_WORKER_ERROR:
             return "WORKER_ERROR";
+
+        case rpc::EXECUTION_OUTCOME_TIMED_OUT:
+            return "TIMED_OUT";
+
+        case rpc::EXECUTION_OUTCOME_WORKER_STOPPED:
+            return "WORKER_STOPPED";
 
         default:
             return "UNSPECIFIED";
@@ -472,6 +530,8 @@ int run_submit_job(
 
         std::uint64_t max_attempts = 3;
 
+        std::optional<std::uint64_t> timeout_ms;
+
         std::vector<std::string> tags;
 
         int command_start = -1;
@@ -537,6 +597,22 @@ int run_submit_job(
                 max_attempts =
                     static_cast<std::uint64_t>(
                         parsed_max_attempts
+                    );
+
+                continue;
+            }
+
+            if (argument == "--timeout-ms") {
+                if (index + 1 >= argc) {
+                    throw std::invalid_argument{
+                        "--timeout-ms requires a value"
+                    };
+                }
+
+                timeout_ms =
+                    parse_positive_uint64(
+                        argv[++index],
+                        "timeout-ms"
                     );
 
                 continue;
@@ -614,7 +690,18 @@ int run_submit_job(
             ) {
                 command->add_args(argv[index]);
             }
+
+            if (timeout_ms.has_value()) {
+                command->set_timeout_ms(*timeout_ms);
+            }
         } else {
+            if (timeout_ms.has_value()) {
+                throw std::invalid_argument{
+                    "--timeout-ms requires a command "
+                    "(pass -- <executable> [args...])"
+                };
+            }
+
             workload->set_kind(
                 rpc::WORKLOAD_KIND_SLEEP
             );

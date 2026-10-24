@@ -171,34 +171,13 @@ void InMemoryCoordinator::record_worker_heartbeat(
         heartbeat_time
     );
 
-    auto job_records =
-        job_repository_.list();
-
-    for (auto& record : job_records) {
-        if (
-            !record.assigned_worker_id.has_value() ||
-            *record.assigned_worker_id !=
-                worker_id
-        ) {
-            continue;
-        }
-
-        if (
-            !is_active_state(
-                record.job.state()
-            )
-        ) {
-            continue;
-        }
-
-        record.lease_expires_at =
-            heartbeat_time +
-            lease_duration_;
-
-        job_repository_.update(
-            std::move(record)
-        );
-    }
+    /*
+     * A worker heartbeat proves only that the worker process is
+     * reachable. It does not prove that every job it was last known
+     * to be running still has permission to execute - that
+     * requires the caller to renew specific, fenced attempts via
+     * renew_job_attempt_leases.
+     */
 }
 
 std::size_t
@@ -730,8 +709,20 @@ std::size_t InMemoryCoordinator::renew_job_attempt_leases(
     const std::vector<JobAttempt>& attempts,
     persistence::JobLeaseTimePoint now
 ) {
-    std::size_t renewed_count = 0;
-    std::vector<domain::JobId> renewed_job_ids;
+    return renew_job_attempt_leases_detailed(
+        worker_id,
+        attempts,
+        now
+    ).size();
+}
+
+std::vector<JobAttempt>
+InMemoryCoordinator::renew_job_attempt_leases_detailed(
+    const domain::WorkerId& worker_id,
+    const std::vector<JobAttempt>& attempts,
+    persistence::JobLeaseTimePoint now
+) {
+    std::vector<JobAttempt> renewed_attempts;
 
     for (const auto& attempt : attempts) {
         auto record = job_repository_.get(attempt.job_id);
@@ -751,8 +742,8 @@ std::size_t InMemoryCoordinator::renew_job_attempt_leases(
 
         bool already_renewed = false;
 
-        for (const auto& job_id : renewed_job_ids) {
-            if (job_id == attempt.job_id) {
+        for (const auto& renewed : renewed_attempts) {
+            if (renewed.job_id == attempt.job_id) {
                 already_renewed = true;
                 break;
             }
@@ -769,11 +760,10 @@ std::size_t InMemoryCoordinator::renew_job_attempt_leases(
             job_repository_.update(std::move(*record));
         }
 
-        renewed_job_ids.push_back(attempt.job_id);
-        ++renewed_count;
+        renewed_attempts.push_back(attempt);
     }
 
-    return renewed_count;
+    return renewed_attempts;
 }
 
 void InMemoryCoordinator::mark_running(
@@ -1013,6 +1003,11 @@ InMemoryCoordinator::is_job_assigned_to_worker(
         record->assigned_worker_id.has_value() &&
         *record->assigned_worker_id ==
             worker_id;
+}
+
+std::chrono::milliseconds
+InMemoryCoordinator::lease_duration() const noexcept {
+    return lease_duration_;
 }
 
 std::optional<domain::WorkerSnapshot>

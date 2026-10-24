@@ -377,17 +377,6 @@ public:
                     request->workload()
                 );
 
-            if (
-                workload.kind() ==
-                    domain::WorkloadKind::command &&
-                workload.command_spec().timeout.has_value()
-            ) {
-                return grpc::Status{
-                    grpc::StatusCode::UNIMPLEMENTED,
-                    "Command execution timeouts are not enabled yet"
-                };
-            }
-
             std::size_t max_attempts =
                 domain::Job::default_max_attempts;
 
@@ -660,22 +649,62 @@ public:
                 radahn::persistence::
                     WorkerHeartbeatClock::now();
 
-            std::vector<domain::JobId> active_job_ids;
+            std::vector<radahn::coordinator::JobAttempt>
+                requested_attempts;
 
-            active_job_ids.reserve(
+            requested_attempts.reserve(
                 static_cast<std::size_t>(
-                    request->active_job_ids_size()
+                    request->active_attempts_size()
                 )
             );
 
             for (
-                const auto& job_id :
-                request->active_job_ids()
+                const auto& attempt :
+                request->active_attempts()
             ) {
-                active_job_ids.emplace_back(
-                    job_id
-                );
+                if (
+                    attempt.job_id().empty() ||
+                    attempt.attempt_number() == 0
+                ) {
+                    return grpc::Status{
+                        grpc::StatusCode::INVALID_ARGUMENT,
+                        "Heartbeat attempt entries require a job "
+                        "ID and a positive attempt number"
+                    };
+                }
+
+                const radahn::coordinator::JobAttempt
+                    candidate{
+                        domain::JobId{attempt.job_id()},
+                        attempt.attempt_number()
+                    };
+
+                bool already_present = false;
+
+                for (
+                    const auto& existing :
+                    requested_attempts
+                ) {
+                    if (
+                        existing.job_id ==
+                            candidate.job_id &&
+                        existing.attempt_number ==
+                            candidate.attempt_number
+                    ) {
+                        already_present = true;
+                        break;
+                    }
+                }
+
+                if (!already_present) {
+                    requested_attempts.push_back(
+                        candidate
+                    );
+                }
             }
+
+            std::vector<radahn::coordinator::JobAttempt>
+                renewed_attempts;
 
             {
                 const std::lock_guard lock{
@@ -698,14 +727,13 @@ public:
                     heartbeat_time
                 );
 
-                static_cast<void>(
+                renewed_attempts =
                     coordinator_
-                        .renew_job_leases_for_worker(
+                        .renew_job_attempt_leases_detailed(
                             worker_id,
-                            active_job_ids,
+                            requested_attempts,
                             heartbeat_time
-                        )
-                );
+                        );
             }
 
             const auto coordinator_time_unix_ms =
@@ -717,6 +745,25 @@ public:
 
             response->set_coordinator_time_unix_ms(
                 coordinator_time_unix_ms
+            );
+
+            for (const auto& attempt : renewed_attempts) {
+                auto* renewed =
+                    response->add_renewed_attempts();
+
+                renewed->set_job_id(
+                    attempt.job_id.value()
+                );
+
+                renewed->set_attempt_number(
+                    attempt.attempt_number
+                );
+            }
+
+            response->set_lease_duration_ms(
+                static_cast<std::uint64_t>(
+                    coordinator_.lease_duration().count()
+                )
             );
 
             return grpc::Status::OK;
@@ -825,45 +872,34 @@ public:
                 request->job_id()
             };
 
+            if (request->attempt_number() == 0) {
+                return grpc::Status{
+                    grpc::StatusCode::INVALID_ARGUMENT,
+                    "attempt_number must be positive"
+                };
+            }
+
+            const radahn::coordinator::JobAttempt attempt{
+                job_id,
+                request->attempt_number()
+            };
+
             std::optional<domain::Job> job;
 
             {
                 const std::lock_guard lock{mutex_};
 
                 if (
-                    !coordinator_
-                        .is_job_assigned_to_worker(
-                            job_id,
-                            worker_id
-                        )
+                    !coordinator_.start_job_attempt(
+                        worker_id,
+                        attempt,
+                        radahn::persistence::
+                            JobLeaseClock::now()
+                    )
                 ) {
                     return grpc::Status{
                         grpc::StatusCode::FAILED_PRECONDITION,
-                        "Job is not assigned to this worker"
-                    };
-                }
-
-                const auto state =
-                    coordinator_.job_state(
-                        job_id
-                    );
-
-                if (
-                    state.has_value() &&
-                    *state ==
-                        domain::JobState::leased
-                ) {
-                    coordinator_.mark_running(
-                        job_id
-                    );
-                } else if (
-                    !state.has_value() ||
-                    *state !=
-                        domain::JobState::running
-                ) {
-                    return grpc::Status{
-                        grpc::StatusCode::FAILED_PRECONDITION,
-                        "Job is not in a startable state"
+                        "Job attempt could not be started"
                     };
                 }
 
@@ -882,6 +918,12 @@ public:
             fill_job_info(
                 *job,
                 response->mutable_job()
+            );
+
+            response->set_lease_duration_ms(
+                static_cast<std::uint64_t>(
+                    coordinator_.lease_duration().count()
+                )
             );
 
             return grpc::Status::OK;
@@ -914,70 +956,71 @@ public:
                 request->job_id()
             };
 
+            if (request->attempt_number() == 0) {
+                return grpc::Status{
+                    grpc::StatusCode::INVALID_ARGUMENT,
+                    "attempt_number must be positive"
+                };
+            }
+
+            if (!request->has_execution_result()) {
+                return grpc::Status{
+                    grpc::StatusCode::INVALID_ARGUMENT,
+                    "An execution result is required"
+                };
+            }
+
+            if (
+                request->outcome() ==
+                rpc::JOB_OUTCOME_UNSPECIFIED
+            ) {
+                return grpc::Status{
+                    grpc::StatusCode::INVALID_ARGUMENT,
+                    "A valid job outcome is required"
+                };
+            }
+
+            const domain::ExecutionResult result =
+                radahn::rpc_codec::decode_execution_result(
+                    request->execution_result()
+                );
+
+            const bool legacy_outcome_agrees =
+                (
+                    request->outcome() ==
+                        rpc::JOB_OUTCOME_SUCCEEDED
+                ) == result.succeeded();
+
+            if (!legacy_outcome_agrees) {
+                return grpc::Status{
+                    grpc::StatusCode::INVALID_ARGUMENT,
+                    "outcome does not match the execution result"
+                };
+            }
+
+            const radahn::coordinator::JobAttempt attempt{
+                job_id,
+                request->attempt_number()
+            };
+
             std::optional<domain::Job> job;
 
             {
                 const std::lock_guard lock{mutex_};
 
                 if (
-                    !coordinator_
-                        .is_job_assigned_to_worker(
-                            job_id,
-                            worker_id
-                        )
+                    !coordinator_.finish_job_attempt(
+                        worker_id,
+                        attempt,
+                        result,
+                        radahn::persistence::
+                            JobLeaseClock::now()
+                    )
                 ) {
                     return grpc::Status{
                         grpc::StatusCode::FAILED_PRECONDITION,
-                        "Job is not assigned to this worker"
+                        "Job attempt could not be finished"
                     };
-                }
-
-                const auto state =
-                    coordinator_.job_state(
-                        job_id
-                    );
-
-                if (
-                    !state.has_value() ||
-                    *state !=
-                        domain::JobState::running
-                ) {
-                    return grpc::Status{
-                        grpc::StatusCode::FAILED_PRECONDITION,
-                        "Job is not running"
-                    };
-                }
-
-                std::optional<domain::ExecutionResult> result;
-
-                if (request->has_execution_result()) {
-                    result =
-                        radahn::rpc_codec::decode_execution_result(
-                            request->execution_result()
-                        );
-                }
-
-                switch (request->outcome()) {
-                    case rpc::JOB_OUTCOME_SUCCEEDED:
-                        coordinator_.mark_succeeded(
-                            job_id,
-                            result
-                        );
-                        break;
-
-                    case rpc::JOB_OUTCOME_FAILED:
-                        coordinator_.mark_failed(
-                            job_id,
-                            result
-                        );
-                        break;
-
-                    case rpc::JOB_OUTCOME_UNSPECIFIED:
-                    default:
-                        return grpc::Status{
-                            grpc::StatusCode::INVALID_ARGUMENT,
-                            "A valid job outcome is required"
-                        };
                 }
 
                 job = coordinator_.get_job(

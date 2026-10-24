@@ -9,7 +9,7 @@ namespace radahn::persistence {
 
 namespace {
 
-constexpr std::int64_t current_schema_version = 6;
+constexpr std::int64_t current_schema_version = 7;
 
 void create_latest_schema(
     SqliteDatabase& database
@@ -115,7 +115,7 @@ void create_latest_schema(
                 job_id TEXT PRIMARY KEY NOT NULL,
 
                 outcome INTEGER NOT NULL
-                    CHECK(outcome IN (1, 2, 3, 4)),
+                    CHECK(outcome IN (1, 2, 3, 4, 5, 6)),
 
                 exit_code INTEGER
                     CHECK(exit_code BETWEEN 0 AND 255),
@@ -142,7 +142,7 @@ void create_latest_schema(
                     )
                     OR
                     (
-                        outcome IN (3, 4) AND
+                        outcome IN (3, 4, 5, 6) AND
                         exit_code IS NULL AND
                         terminating_signal IS NULL
                     )
@@ -335,6 +335,24 @@ void record_schema_migration(
         return;
     }
 
+    if (version == 7) {
+        database.execute(
+            R"sql(
+                INSERT OR IGNORE INTO schema_migrations (
+                    version,
+                    applied_at_unix_ms
+                )
+                VALUES (
+                    7,
+                    CAST(strftime('%s', 'now') AS INTEGER)
+                        * 1000
+                );
+            )sql"
+        );
+
+        return;
+    }
+
     throw std::logic_error{
         "Unknown SQLite schema migration"
     };
@@ -407,6 +425,88 @@ void upgrade_version_three_to_four(
     record_schema_migration(
         database,
         4
+    );
+}
+
+/*
+ * SQLite does not support altering a CHECK constraint in place, so
+ * an expanded constraint set requires rebuilding the table: create
+ * the replacement with the new constraints, copy every existing
+ * row across, drop the old table, then rename the replacement into
+ * its place - all inside the caller's single transaction.
+ */
+void upgrade_version_six_to_seven(
+    SqliteDatabase& database
+) {
+    database.execute(
+        R"sql(
+            CREATE TABLE job_execution_results_v7 (
+                job_id TEXT PRIMARY KEY NOT NULL,
+
+                outcome INTEGER NOT NULL
+                    CHECK(outcome IN (1, 2, 3, 4, 5, 6)),
+
+                exit_code INTEGER
+                    CHECK(exit_code BETWEEN 0 AND 255),
+
+                terminating_signal INTEGER
+                    CHECK(
+                        terminating_signal > 0 AND
+                        terminating_signal <= 2147483647
+                    ),
+
+                diagnostic TEXT NOT NULL,
+
+                CHECK(
+                    (
+                        outcome = 1 AND
+                        exit_code IS NOT NULL AND
+                        terminating_signal IS NULL
+                    )
+                    OR
+                    (
+                        outcome = 2 AND
+                        exit_code IS NULL AND
+                        terminating_signal IS NOT NULL
+                    )
+                    OR
+                    (
+                        outcome IN (3, 4, 5, 6) AND
+                        exit_code IS NULL AND
+                        terminating_signal IS NULL
+                    )
+                ),
+
+                FOREIGN KEY (job_id)
+                    REFERENCES jobs(job_id)
+                    ON DELETE CASCADE
+            );
+
+            INSERT INTO job_execution_results_v7 (
+                job_id,
+                outcome,
+                exit_code,
+                terminating_signal,
+                diagnostic
+            )
+            SELECT
+                job_id,
+                outcome,
+                exit_code,
+                terminating_signal,
+                diagnostic
+            FROM job_execution_results;
+
+            DROP TABLE job_execution_results;
+
+            ALTER TABLE job_execution_results_v7
+                RENAME TO job_execution_results;
+        )sql"
+    );
+
+    record_schema_migration(
+        database,
+        7
     );
 }
 
@@ -485,6 +585,21 @@ void initialize_sqlite_schema(
             }
 
             /*
+             * job_execution_results only exists from version 5
+             * onward. Below that, create_latest_schema() below
+             * creates it fresh, already with the expanded outcome
+             * constraints - there is nothing to rebuild.
+             */
+            if (
+                existing_version >= 5 &&
+                existing_version < 7
+            ) {
+                upgrade_version_six_to_seven(
+                    database
+                );
+            }
+
+            /*
              * Ensure all current tables and indexes exist
              *
              * CREATE ... IF NOT EXISTS makes this safe for
@@ -521,9 +636,10 @@ void initialize_sqlite_schema(
         );
 
         record_schema_migration(database, 6);
+        record_schema_migration(database, 7);
 
         database.execute(
-            "PRAGMA user_version = 6;"
+            "PRAGMA user_version = 7;"
         );
 
         database.execute(

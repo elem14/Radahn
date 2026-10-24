@@ -12,7 +12,16 @@ enum class ExecutionOutcome {
     exited = 1,
     signaled = 2,
     spawn_failed = 3,
-    worker_error = 4
+    worker_error = 4,
+
+    // The configured execution deadline caused termination. Unlike
+    // `signaled`, this describes why Radahn stopped the process
+    // rather than an otherwise unrequested signal.
+    timed_out = 5,
+
+    // The worker deliberately stopped execution, such as during
+    // bounded shutdown.
+    worker_stopped = 6
 };
 
 struct ExecutionResult {
@@ -61,6 +70,8 @@ struct ExecutionResult {
 
             case ExecutionOutcome::spawn_failed:
             case ExecutionOutcome::worker_error:
+            case ExecutionOutcome::timed_out:
+            case ExecutionOutcome::worker_stopped:
                 if (
                     exit_code.has_value() ||
                     terminating_signal.has_value()

@@ -26,6 +26,7 @@
 
 #include "worker_service.grpc.pb.h"
 #include "active_job_registry.hpp"
+#include "completion_reporter.hpp"
 #include "heartbeat_loop.hpp"
 #include "radahn/domain/version.hpp"
 
@@ -536,12 +537,14 @@ grpc::Status start_job(
     rpc::WorkerService::Stub& stub,
     const std::string& worker_id,
     const std::string& job_id,
+    std::uint64_t attempt_number,
     rpc::StartJobResponse* response
 ) {
     rpc::StartJobRequest request;
 
     request.set_worker_id(worker_id);
     request.set_job_id(job_id);
+    request.set_attempt_number(attempt_number);
 
     grpc::ClientContext context;
 
@@ -551,39 +554,6 @@ grpc::Status start_job(
     );
 
     return stub.StartJob(
-        &context,
-        request,
-        response
-    );
-}
-
-grpc::Status finish_job(
-    rpc::WorkerService::Stub& stub,
-    const std::string& worker_id,
-    const std::string& job_id,
-    rpc::JobOutcome outcome,
-    const radahn::domain::ExecutionResult& result,
-    rpc::FinishJobResponse* response
-) {
-    rpc::FinishJobRequest request;
-
-    request.set_worker_id(worker_id);
-    request.set_job_id(job_id);
-    request.set_outcome(outcome);
-
-    radahn::rpc_codec::encode_execution_result(
-        result,
-        *request.mutable_execution_result()
-    );
-
-    grpc::ClientContext context;
-
-    context.set_deadline(
-        std::chrono::system_clock::now() +
-        std::chrono::seconds{5}
-    );
-
-    return stub.FinishJob(
         &context,
         request,
         response
@@ -911,6 +881,23 @@ int main(int argc, char* argv[]) {
 
         print_job(response.job());
 
+        const std::uint64_t attempt_number =
+            response.job().attempt_count();
+
+        if (attempt_number == 0) {
+            std::cerr
+                << "Coordinator assigned job "
+                << response.job().id()
+                << " with an invalid attempt number 0;"
+                << " will retry acquiring it\n";
+
+            interruptible_sleep(
+                std::chrono::seconds{2}
+            );
+
+            continue;
+        }
+
         rpc::StartJobResponse start_response;
 
         const grpc::Status start_status =
@@ -918,6 +905,7 @@ int main(int argc, char* argv[]) {
                 *stub,
                 config.worker_id,
                 response.job().id(),
+                attempt_number,
                 &start_response
             );
 
@@ -935,6 +923,20 @@ int main(int argc, char* argv[]) {
             continue;
         }
 
+        if (
+            start_response.job().id() !=
+                response.job().id() ||
+            start_response.job().attempt_count() !=
+                attempt_number
+        ) {
+            std::cerr
+                << "StartJob response did not confirm the "
+                << "expected job and attempt; will retry "
+                << "acquiring it\n";
+
+            continue;
+        }
+
         std::cout
             << "Job entered RUNNING state\n";
 
@@ -944,91 +946,160 @@ int main(int argc, char* argv[]) {
         const rpc::JobInfo job_info =
             start_response.job();
 
-        active_jobs.add(job_id);
+        const radahn::worker_app::ActiveAttempt
+            active_attempt{
+                job_id,
+                attempt_number
+            };
 
-        running_jobs.push_back(
-            std::async(
-                std::launch::async,
-                [
-                    &stub_ref = *stub,
-                    &active_jobs,
-                    worker_id = config.worker_id,
-                    job_id,
-                    job_info
-                ]() {
+        active_jobs.add(active_attempt);
 
-                    radahn::domain::ExecutionResult result{
-                        radahn::domain::ExecutionOutcome::worker_error,
-                        std::nullopt,
-                        std::nullopt,
-                        "Execution did not complete"
-                    };
+        try {
+            running_jobs.push_back(
+                std::async(
+                    std::launch::async,
+                    [
+                        &stub_ref = *stub,
+                        &active_jobs,
+                        worker_id = config.worker_id,
+                        job_id,
+                        attempt_number,
+                        job_info,
+                        active_attempt
+                    ]() {
 
-                    try {
-                        result = execute_job(job_info);
-                    } catch (const std::exception& error) {
-                        result = radahn::domain::ExecutionResult{
+                        radahn::domain::ExecutionResult result{
                             radahn::domain::ExecutionOutcome::worker_error,
                             std::nullopt,
                             std::nullopt,
-                            error.what()
+                            "Execution did not complete"
                         };
 
-                        write_log(
-                            std::cerr,
-                            "Job " + job_id +
-                            " execution error: " + error.what()
-                        );
-                    }
+                        try {
+                            result = execute_job(job_info);
+                        } catch (const std::exception& error) {
+                            result = radahn::domain::ExecutionResult{
+                                radahn::domain::ExecutionOutcome::worker_error,
+                                std::nullopt,
+                                std::nullopt,
+                                error.what()
+                            };
 
-                    const bool succeeded = result.succeeded();
+                            write_log(
+                                std::cerr,
+                                "Job " + job_id +
+                                " execution error: " + error.what()
+                            );
+                        }
 
-                    rpc::FinishJobResponse
-                        finish_response;
+                        /*
+                         * Execution is finished; this attempt
+                         * enters its reporting phase. It stays
+                         * registered for heartbeat renewal while
+                         * its completion is pending, but must not
+                         * be executed again.
+                         */
+                        radahn::worker_app::PendingCompletion
+                            pending{
+                                radahn::worker_app::CompletionRecord{
+                                    worker_id,
+                                    job_id,
+                                    attempt_number,
+                                    result
+                                },
+                                radahn::worker_app::
+                                    CompletionPhase::reporting
+                            };
 
-                    const grpc::Status
-                        finish_status =
-                            finish_job(
-                                stub_ref,
-                                worker_id,
-                                job_id,
-                                succeeded
-                                    ? rpc::JOB_OUTCOME_SUCCEEDED
-                                    : rpc::JOB_OUTCOME_FAILED,
-                                result,
-                                &finish_response
+                        radahn::worker_app::
+                            GrpcCompletionTransport
+                                transport{stub_ref};
+
+                        const radahn::worker_app::
+                            CompletionReporter
+                                reporter{transport};
+
+                        const auto report_result =
+                            reporter.report(
+                                pending.record,
+                                [] {
+                                    return
+                                        !g_shutdown_requested
+                                            .load();
+                                }
                             );
 
-                    if (!finish_status.ok()) {
-                        std::cerr
-                            << "Could not finish job "
-                            << job_id
-                            << " (gRPC code "
-                            << static_cast<int>(
-                                finish_status
-                                    .error_code()
-                            )
-                            << "): "
-                            << finish_status
-                                   .error_message()
-                            << '\n';
-                    } else {
-                        std::cout
-                            << "Job "
-                            << job_id
-                            << " completed with state "
-                            << (
-                                succeeded
-                                    ? "SUCCEEDED"
-                                    : "FAILED"
-                            )
-                            << '\n';
-                    }
+                        switch (report_result) {
+                            case radahn::worker_app::
+                                CompletionReportResult::
+                                    accepted:
+                                std::cout
+                                    << "Job "
+                                    << job_id
+                                    << " completed with state "
+                                    << (
+                                        result.succeeded()
+                                            ? "SUCCEEDED"
+                                            : "FAILED"
+                                    )
+                                    << '\n';
+                                break;
 
-                    active_jobs.remove(job_id);
-                }
-            )
-        );
+                            case radahn::worker_app::
+                                CompletionReportResult::
+                                    rejected:
+                                std::cerr
+                                    << "Completion for job "
+                                    << job_id
+                                    << " attempt "
+                                    << attempt_number
+                                    << " was rejected; this "
+                                    << "worker no longer holds "
+                                    << "lease authority over it\n";
+                                break;
+
+                            case radahn::worker_app::
+                                CompletionReportResult::
+                                    invalid:
+                                std::cerr
+                                    << "Completion for job "
+                                    << job_id
+                                    << " was reported as "
+                                    << "malformed; giving up\n";
+                                break;
+
+                            case radahn::worker_app::
+                                CompletionReportResult::
+                                    deadline_exceeded:
+                                std::cerr
+                                    << "Giving up reporting "
+                                    << "completion for job "
+                                    << job_id
+                                    << " after the reporting "
+                                    << "deadline elapsed\n";
+                                break;
+                        }
+
+                        active_jobs.remove(active_attempt);
+                    }
+                )
+            );
+        } catch (const std::exception& error) {
+            /*
+             * std::async failed to launch the execution thread.
+             * Remove the registration and let the assignment's
+             * lease expire naturally rather than renewing a
+             * phantom task forever.
+             */
+            active_jobs.remove(active_attempt);
+
+            std::cerr
+                << "Could not launch execution for job "
+                << job_id
+                << ": "
+                << error.what()
+                << '\n';
+        }
     }
 
     std::cout

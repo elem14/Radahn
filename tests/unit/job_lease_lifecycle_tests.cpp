@@ -232,16 +232,55 @@ void test_job_lease_lifecycle() {
     );
 
     /*
-     * Use a fixed future heartbeat so the expected renewed
-     * deadline can be compared exactly.
+     * Use a fixed future heartbeat, still comfortably inside the
+     * current lease window, so the expected renewed deadline can be
+     * compared exactly without the lease having already expired.
      */
     const auto heartbeat_time =
         JobLeaseClock::now() +
-        std::chrono::hours{1};
+        std::chrono::seconds{10};
 
     coordinator.record_worker_heartbeat(
         worker_id,
         heartbeat_time
+    );
+
+    const auto heartbeat_only_record =
+        job_repository.get(
+            job_id
+        );
+
+    expect(
+        heartbeat_only_record.has_value() &&
+        heartbeat_only_record->lease_expires_at ==
+            running_record->lease_expires_at,
+        "A bare heartbeat proves liveness but does not "
+        "by itself renew any job lease"
+    );
+
+    /*
+     * Worker liveness alone proves nothing about any one attempt -
+     * renewal must be explicitly requested for the attempt(s) the
+     * worker still considers running.
+     */
+    const radahn::coordinator::JobAttempt
+        running_attempt{
+            job_id,
+            static_cast<std::uint64_t>(
+                running_record->job.attempt_count()
+            )
+        };
+
+    const auto renewed_count =
+        coordinator.renew_job_attempt_leases(
+            worker_id,
+            {running_attempt},
+            heartbeat_time
+        );
+
+    expect(
+        renewed_count == 1,
+        "Explicitly requested attempt renewal succeeds"
     );
 
     const auto renewed_record =
@@ -256,7 +295,7 @@ void test_job_lease_lifecycle() {
         *renewed_record->lease_expires_at ==
             heartbeat_time +
                 lease_duration,
-        "Worker heartbeat renews active job lease"
+        "Explicit attempt renewal extends the job lease"
     );
 
     coordinator.mark_succeeded(

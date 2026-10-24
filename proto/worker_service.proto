@@ -47,19 +47,37 @@ message RegisterWorkerResponse {
   bool already_registered = 2;
 }
 
+message JobAttempt {
+  string job_id = 1;
+  uint64 attempt_number = 2;
+}
+
 message HeartbeatRequest {
   string worker_id = 1;
 
-  // Job IDs the worker currently considers actively RUNNING on it.
-  // The coordinator renews the lease of each such job independently,
-  // so one stuck job does not keep other, healthy jobs alive by
-  // association, and does not itself get renewed by another job's
-  // heartbeat activity.
-  repeated string active_job_ids = 2;
+  reserved 2;
+  reserved "active_job_ids";
+
+  // Job attempts the worker currently considers actively RUNNING on
+  // it. The coordinator renews the lease of each matching, running,
+  // unexpired attempt independently, so one stuck job does not keep
+  // other, healthy jobs alive by association, and does not itself
+  // get renewed by another job's heartbeat activity. A worker that
+  // only identifies a job by ID (the old protocol) cannot silently
+  // fall back to renewing by ID alone; the field type itself forces
+  // every caller to supply an attempt number.
+  repeated JobAttempt active_attempts = 3;
 }
 
 message HeartbeatResponse {
   int64 coordinator_time_unix_ms = 1;
+
+  // The attempts whose leases were actually renewed by this
+  // heartbeat, so the worker never infers renewal merely because
+  // the RPC returned OK.
+  repeated JobAttempt renewed_attempts = 2;
+
+  uint64 lease_duration_ms = 3;
 }
 
 message AcquireJobRequest {
@@ -74,10 +92,16 @@ message AcquireJobResponse {
 message StartJobRequest {
   string worker_id = 1;
   string job_id = 2;
+
+  // Attempt 0 is invalid. The worker captures this value from
+  // AcquireJobResponse.job.attempt_count and uses the same number
+  // for start, renewal, and completion of this attempt.
+  uint64 attempt_number = 3;
 }
 
 message StartJobResponse {
   JobInfo job = 1;
+  uint64 lease_duration_ms = 2;
 }
 
 enum JobOutcome {
@@ -91,6 +115,7 @@ message FinishJobRequest {
   string job_id = 2;
   JobOutcome outcome = 3;
   ExecutionResult execution_result = 4;
+  uint64 attempt_number = 5;
 }
 
 message FinishJobResponse {

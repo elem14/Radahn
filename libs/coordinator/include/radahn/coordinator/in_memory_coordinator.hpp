@@ -111,6 +111,16 @@ public:
         persistence::JobLeaseTimePoint now
     );
 
+    // Same renewal, returning the identities actually renewed so a
+    // caller (e.g. the Heartbeat RPC handler) never has to guess
+    // them back out of the request it sent in.
+    [[nodiscard]]
+    std::vector<JobAttempt> renew_job_attempt_leases_detailed(
+        const domain::WorkerId& worker_id,
+        const std::vector<JobAttempt>& attempts,
+        persistence::JobLeaseTimePoint now
+    );
+
     void mark_running(
         const domain::JobId& job_id
     );
@@ -168,6 +178,10 @@ public:
     worker_snapshot(
         const domain::WorkerId& worker_id
     ) const;
+
+    [[nodiscard]]
+    std::chrono::milliseconds
+    lease_duration() const noexcept;
 
 private:
     [[nodiscard]]

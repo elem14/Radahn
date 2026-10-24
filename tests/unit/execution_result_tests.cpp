@@ -95,6 +95,18 @@ void run_tests() {
             std::nullopt,
             std::nullopt,
             "Could not create output directory"
+        },
+        {
+            d::ExecutionOutcome::timed_out,
+            std::nullopt,
+            std::nullopt,
+            "Execution deadline exceeded"
+        },
+        {
+            d::ExecutionOutcome::worker_stopped,
+            std::nullopt,
+            std::nullopt,
+            "Worker shutdown stopped execution"
         }
     };
 

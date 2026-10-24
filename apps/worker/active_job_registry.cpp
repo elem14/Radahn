@@ -5,40 +5,51 @@
 namespace radahn::worker_app {
 
 void ActiveJobRegistry::add(
-    const std::string& job_id
-) {
-    const std::lock_guard lock{mutex_};
-
-    job_ids_.push_back(job_id);
-}
-
-void ActiveJobRegistry::remove(
-    const std::string& job_id
+    const ActiveAttempt& attempt
 ) {
     const std::lock_guard lock{mutex_};
 
     const auto iterator = std::find(
-        job_ids_.begin(),
-        job_ids_.end(),
-        job_id
+        attempts_.begin(),
+        attempts_.end(),
+        attempt
     );
 
-    if (iterator != job_ids_.end()) {
-        job_ids_.erase(iterator);
+    // Reject an exact duplicate add rather than tracking it twice.
+    if (iterator != attempts_.end()) {
+        return;
+    }
+
+    attempts_.push_back(attempt);
+}
+
+void ActiveJobRegistry::remove(
+    const ActiveAttempt& attempt
+) {
+    const std::lock_guard lock{mutex_};
+
+    const auto iterator = std::find(
+        attempts_.begin(),
+        attempts_.end(),
+        attempt
+    );
+
+    if (iterator != attempts_.end()) {
+        attempts_.erase(iterator);
     }
 }
 
-std::vector<std::string>
+std::vector<ActiveAttempt>
 ActiveJobRegistry::snapshot() const {
     const std::lock_guard lock{mutex_};
 
-    return job_ids_;
+    return attempts_;
 }
 
 std::size_t ActiveJobRegistry::size() const {
     const std::lock_guard lock{mutex_};
 
-    return job_ids_.size();
+    return attempts_.size();
 }
 
 }  // namespace radahn::worker_app

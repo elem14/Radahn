@@ -109,12 +109,22 @@ void HeartbeatLoop::run() {
             worker_id_
         );
 
+        const auto active_snapshot =
+            active_jobs_.snapshot();
+
         for (
-            const auto& job_id :
-            active_jobs_.snapshot()
+            const auto& attempt :
+            active_snapshot
         ) {
-            request.add_active_job_ids(
-                job_id
+            auto* active_attempt =
+                request.add_active_attempts();
+
+            active_attempt->set_job_id(
+                attempt.job_id
+            );
+
+            active_attempt->set_attempt_number(
+                attempt.attempt_number
             );
         }
 
@@ -134,6 +144,24 @@ void HeartbeatLoop::run() {
                     << '\n';
 
                 acknowledged_once = true;
+            }
+
+            /*
+             * Renewal is never inferred merely because the RPC
+             * returned OK - only the attempts the coordinator
+             * explicitly names here were actually renewed.
+             */
+            if (
+                static_cast<std::size_t>(
+                    response.renewed_attempts_size()
+                ) != active_snapshot.size()
+            ) {
+                std::cerr
+                    << "Heartbeat renewed "
+                    << response.renewed_attempts_size()
+                    << " of "
+                    << active_snapshot.size()
+                    << " reported attempt(s)\n";
             }
         } else if (
             !stop_requested_.load()
