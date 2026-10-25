@@ -227,6 +227,25 @@ add_test(
 )
 
 add_executable(
+    radahn-job-log-repository-tests
+    unit/job_log_repository_tests.cpp
+)
+
+target_link_libraries(
+    radahn-job-log-repository-tests
+    PRIVATE
+        radahn_persistence
+        radahn_domain
+        radahn_project_options
+        radahn_project_warnings
+)
+
+add_test(
+    NAME radahn.job_log_repository
+    COMMAND radahn-job-log-repository-tests
+)
+
+add_executable(
     radahn-sqlite-coordinator-integration-tests
     unit/sqlite_coordinator_integration_tests.cpp
 )
@@ -591,6 +610,27 @@ add_test(
 )
 
 add_executable(
+    radahn-event-logging-tests
+    unit/event_logging_tests.cpp
+)
+
+target_link_libraries(
+    radahn-event-logging-tests
+    PRIVATE
+        radahn_coordinator
+        radahn_persistence
+        radahn_scheduler
+        radahn_domain
+        radahn_project_options
+        radahn_project_warnings
+)
+
+add_test(
+    NAME radahn.event_logging
+    COMMAND radahn-event-logging-tests
+)
+
+add_executable(
     radahn-job-attempt-fencing-tests
     unit/job_attempt_fencing_tests.cpp
 )
@@ -630,6 +670,31 @@ target_link_libraries(
 add_test(
     NAME radahn.active_job_registry
     COMMAND radahn-active-job-registry-tests
+)
+
+add_executable(
+    radahn-execution-log-registry-tests
+    unit/execution_log_registry_tests.cpp
+    ${CMAKE_SOURCE_DIR}/apps/worker/execution_log_registry.cpp
+)
+
+target_include_directories(
+    radahn-execution-log-registry-tests
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/apps/worker
+)
+
+target_link_libraries(
+    radahn-execution-log-registry-tests
+    PRIVATE
+        radahn_domain
+        radahn_project_options
+        radahn_project_warnings
+)
+
+add_test(
+    NAME radahn.execution_log_registry
+    COMMAND radahn-execution-log-registry-tests
 )
 
 add_executable(

@@ -37,6 +37,9 @@ void print_usage() {
         << " [-- <executable> [args...]]\n"
         << "  radahn job get <id>\n"
         << "  radahn job list\n"
+        << "  radahn job logs <id> [--stderr] [--attempt <n>]\n"
+        << "  radahn worker list\n"
+        << "  radahn worker get <worker-id>\n"
         << "  radahn help\n";
 }
 
@@ -416,6 +419,79 @@ void print_job(
     } else {
         std::cout
             << "  Execution result: not recorded\n";
+    }
+
+    if (job.has_assigned_worker_id()) {
+        std::cout
+            << "  Assigned worker: "
+            << job.assigned_worker_id()
+            << '\n';
+    } else {
+        std::cout
+            << "  Assigned worker: none\n";
+    }
+
+    std::cout
+        << "  stdout log uploaded: "
+        << (job.stdout_log_available() ? "yes" : "no")
+        << '\n'
+        << "  stderr log uploaded: "
+        << (job.stderr_log_available() ? "yes" : "no")
+        << '\n';
+}
+
+[[nodiscard]] std::string_view worker_online_label(
+    bool online
+) noexcept {
+    return online ? "ONLINE" : "OFFLINE";
+}
+
+void print_worker(
+    const rpc::WorkerInfo& worker
+) {
+    std::cout
+        << "Worker: "
+        << worker.worker_id()
+        << '\n'
+        << "  State: "
+        << worker_online_label(worker.online())
+        << '\n'
+        << "  Last heartbeat (unix ms): "
+        << worker.last_heartbeat_unix_ms()
+        << '\n'
+        << "  CPU cores: "
+        << worker.allocated_cpu_cores()
+        << " / "
+        << worker.total_cpu_cores()
+        << " allocated\n"
+        << "  Memory: "
+        << (worker.allocated_memory_bytes() / mebibyte)
+        << " / "
+        << (worker.total_memory_bytes() / mebibyte)
+        << " MiB allocated\n"
+        << "  Disk: "
+        << (worker.allocated_disk_bytes() / mebibyte)
+        << " / "
+        << (worker.total_disk_bytes() / mebibyte)
+        << " MiB allocated\n"
+        << "  Running jobs: "
+        << worker.running_jobs()
+        << " / "
+        << worker.max_concurrent_jobs()
+        << '\n'
+        << "  GPU available: "
+        << (worker.gpu_available() ? "yes" : "no")
+        << '\n'
+        << "  Tags:";
+
+    if (worker.tags().empty()) {
+        std::cout << " none\n";
+    } else {
+        for (const auto& tag : worker.tags()) {
+            std::cout << ' ' << tag;
+        }
+
+        std::cout << '\n';
     }
 }
 
@@ -873,6 +949,184 @@ int run_list_jobs(
     return 0;
 }
 
+int run_list_workers(
+    rpc::ClientService::Stub& stub
+) {
+    rpc::ListWorkersRequest request;
+    rpc::ListWorkersResponse response;
+    grpc::ClientContext context;
+
+    const grpc::Status status =
+        stub.ListWorkers(
+            &context,
+            request,
+            &response
+        );
+
+    if (!status.ok()) {
+        std::cerr
+            << "List workers failed"
+            << " (gRPC code "
+            << static_cast<int>(
+                status.error_code()
+            )
+            << "): "
+            << status.error_message()
+            << '\n';
+
+        return 1;
+    }
+
+    if (response.workers().empty()) {
+        std::cout
+            << "No workers found\n";
+
+        return 0;
+    }
+
+    for (const auto& worker : response.workers()) {
+        std::cout
+            << worker.worker_id()
+            << " | "
+            << worker_online_label(worker.online())
+            << " | jobs "
+            << worker.running_jobs()
+            << " / "
+            << worker.max_concurrent_jobs()
+            << " | CPU "
+            << worker.allocated_cpu_cores()
+            << " / "
+            << worker.total_cpu_cores()
+            << '\n';
+    }
+
+    return 0;
+}
+
+int run_get_worker(
+    rpc::ClientService::Stub& stub,
+    const std::string& worker_id
+) {
+    rpc::GetWorkerRequest request;
+
+    request.set_worker_id(worker_id);
+
+    rpc::GetWorkerResponse response;
+    grpc::ClientContext context;
+
+    const grpc::Status status =
+        stub.GetWorker(
+            &context,
+            request,
+            &response
+        );
+
+    if (!status.ok()) {
+        std::cerr
+            << "Get worker failed"
+            << " (gRPC code "
+            << static_cast<int>(
+                status.error_code()
+            )
+            << "): "
+            << status.error_message()
+            << '\n';
+
+        return 1;
+    }
+
+    print_worker(
+        response.worker()
+    );
+
+    return 0;
+}
+
+int run_get_job_logs(
+    rpc::ClientService::Stub& stub,
+    const std::string& id,
+    bool use_stderr,
+    std::optional<std::uint64_t> attempt_number
+) {
+    rpc::GetJobLogRequest request;
+
+    request.set_id(id);
+
+    request.set_stream(
+        use_stderr
+            ? rpc::LOG_STREAM_STDERR
+            : rpc::LOG_STREAM_STDOUT
+    );
+
+    if (attempt_number.has_value()) {
+        request.set_attempt_number(*attempt_number);
+    }
+
+    rpc::GetJobLogResponse response;
+    grpc::ClientContext context;
+
+    const grpc::Status status =
+        stub.GetJobLog(
+            &context,
+            request,
+            &response
+        );
+
+    if (!status.ok()) {
+        if (
+            status.error_code() ==
+            grpc::StatusCode::NOT_FOUND
+        ) {
+            std::cerr
+                << "Job does not exist: "
+                << id
+                << '\n';
+        } else if (
+            status.error_code() ==
+            grpc::StatusCode::UNAVAILABLE
+        ) {
+            std::cerr
+                << "Logs have not been uploaded for job "
+                << id
+                << '\n';
+        } else {
+            std::cerr
+                << "Get job log failed"
+                << " (gRPC code "
+                << static_cast<int>(
+                    status.error_code()
+                )
+                << "): "
+                << status.error_message()
+                << '\n';
+        }
+
+        return 1;
+    }
+
+    std::cout.write(
+        response.content().data(),
+        static_cast<std::streamsize>(
+            response.content().size()
+        )
+    );
+
+    std::cout.flush();
+
+    if (response.truncated()) {
+        std::cerr
+            << "Notice: log output was truncated; stored "
+            << response.content().size()
+            << " of "
+            << response.original_byte_count()
+            << " original byte(s) (attempt "
+            << response.attempt_number()
+            << ")\n";
+    }
+
+    return 0;
+}
+
 }  // namespace
 
 int main(
@@ -964,9 +1218,119 @@ int main(
             );
         }
 
+        if (job_command == "logs") {
+            if (argc < 4) {
+                std::cerr
+                    << "Usage: radahn job logs <id> "
+                    << "[--stderr] [--attempt <n>]\n";
+
+                return 1;
+            }
+
+            const std::string id{argv[3]};
+
+            bool use_stderr = false;
+            std::optional<std::uint64_t> attempt_number;
+
+            try {
+                for (int index = 4; index < argc; ++index) {
+                    const std::string_view argument{
+                        argv[index]
+                    };
+
+                    if (argument == "--stderr") {
+                        use_stderr = true;
+                        continue;
+                    }
+
+                    if (argument == "--attempt") {
+                        if (index + 1 >= argc) {
+                            throw std::invalid_argument{
+                                "--attempt requires a value"
+                            };
+                        }
+
+                        attempt_number =
+                            parse_positive_uint64(
+                                argv[++index],
+                                "attempt"
+                            );
+
+                        continue;
+                    }
+
+                    throw std::invalid_argument{
+                        "Unknown job logs option: " +
+                        std::string{argument}
+                    };
+                }
+            } catch (const std::exception& error) {
+                std::cerr
+                    << "Invalid arguments: "
+                    << error.what()
+                    << '\n';
+
+                return 1;
+            }
+
+            return run_get_job_logs(
+                *stub,
+                id,
+                use_stderr,
+                attempt_number
+            );
+        }
+
         std::cerr
             << "Unknown job command: "
             << job_command
+            << '\n';
+
+        print_usage();
+
+        return 1;
+    }
+
+    if (command == "worker") {
+        if (argc < 3) {
+            print_usage();
+            return 1;
+        }
+
+        const std::string_view worker_command{
+            argv[2]
+        };
+
+        if (worker_command == "list") {
+            if (argc != 3) {
+                std::cerr
+                    << "Usage: radahn worker list\n";
+
+                return 1;
+            }
+
+            return run_list_workers(
+                *stub
+            );
+        }
+
+        if (worker_command == "get") {
+            if (argc != 4) {
+                std::cerr
+                    << "Usage: radahn worker get <worker-id>\n";
+
+                return 1;
+            }
+
+            return run_get_worker(
+                *stub,
+                argv[3]
+            );
+        }
+
+        std::cerr
+            << "Unknown worker command: "
+            << worker_command
             << '\n';
 
         print_usage();

@@ -19,6 +19,9 @@ service WorkerService {
 
   rpc FinishJob(FinishJobRequest)
       returns (FinishJobResponse);
+
+  rpc UploadJobLog(UploadJobLogRequest)
+      returns (UploadJobLogResponse);
 }
 
 message WorkerResources {
@@ -120,4 +123,17 @@ message FinishJobRequest {
 
 message FinishJobResponse {
   JobInfo job = 1;
+}
+
+message UploadJobLogRequest {
+  string worker_id = 1;
+  string job_id = 2;
+  uint64 attempt_number = 3;
+  LogStream stream = 4;
+  bytes content = 5;
+  uint64 original_byte_count = 6;
+  bool truncated = 7;
+}
+
+message UploadJobLogResponse {
 }

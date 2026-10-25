@@ -10,6 +10,7 @@
 #include <utility>
 #include <vector>
 
+#include "radahn/coordinator/event_log.hpp"
 #include "radahn/domain/execution_result.hpp"
 #include "radahn/domain/job_state.hpp"
 
@@ -308,6 +309,13 @@ InMemoryCoordinator::mark_stale_workers_offline(
             }
         );
 
+        log_event(
+            "worker_offline",
+            {
+                {"worker_id", worker.id().value()}
+            }
+        );
+
         ++marked_offline;
     }
 
@@ -426,6 +434,27 @@ InMemoryCoordinator::mark_expired_job_leases(
                     record
                 );
             });
+
+            log_event(
+                "lease_expired",
+                {
+                    {"job_id", original_record.job.id().value()},
+                    {
+                        "attempt",
+                        std::to_string(
+                            original_record.job.attempt_count()
+                        )
+                    },
+                    {
+                        "worker_id",
+                        original_record.assigned_worker_id
+                                .has_value()
+                            ? original_record
+                                  .assigned_worker_id->value()
+                            : std::string{"none"}
+                    }
+                }
+            );
 
             ++expired_count;
         } catch (...) {
@@ -596,6 +625,17 @@ InMemoryCoordinator::requeue_retry_wait_jobs() {
             throw;
         }
 
+        log_event(
+            "attempt_requeued",
+            {
+                {"job_id", record.job.id().value()},
+                {
+                    "attempt",
+                    std::to_string(record.job.attempt_count())
+                }
+            }
+        );
+
         ++requeued_count;
     }
 
@@ -697,6 +737,21 @@ bool InMemoryCoordinator::start_job_attempt(
         !record->assigned_worker_id.has_value() ||
         *record->assigned_worker_id != worker_id
     ) {
+        if (record.has_value()) {
+            log_event(
+                "lease_rejected",
+                {
+                    {"job_id", attempt.job_id.value()},
+                    {
+                        "attempt",
+                        std::to_string(attempt.attempt_number)
+                    },
+                    {"worker_id", worker_id.value()},
+                    {"reason", "stale_attempt"}
+                }
+            );
+        }
+
         return false;
     }
 
@@ -704,6 +759,16 @@ bool InMemoryCoordinator::start_job_attempt(
         !record->lease_expires_at.has_value() ||
         *record->lease_expires_at <= now
     ) {
+        log_event(
+            "lease_rejected",
+            {
+                {"job_id", attempt.job_id.value()},
+                {"attempt", std::to_string(attempt.attempt_number)},
+                {"worker_id", worker_id.value()},
+                {"reason", "lease_expired"}
+            }
+        );
+
         return false;
     }
 
@@ -713,6 +778,16 @@ bool InMemoryCoordinator::start_job_attempt(
     }
 
     if (record->job.state() != domain::JobState::leased) {
+        log_event(
+            "lease_rejected",
+            {
+                {"job_id", attempt.job_id.value()},
+                {"attempt", std::to_string(attempt.attempt_number)},
+                {"worker_id", worker_id.value()},
+                {"reason", "invalid_state"}
+            }
+        );
+
         return false;
     }
 
@@ -720,6 +795,15 @@ bool InMemoryCoordinator::start_job_attempt(
     record->lease_expires_at = now + lease_duration_;
 
     job_repository_.update(std::move(*record));
+
+    log_event(
+        "attempt_started",
+        {
+            {"job_id", attempt.job_id.value()},
+            {"attempt", std::to_string(attempt.attempt_number)},
+            {"worker_id", worker_id.value()}
+        }
+    );
 
     return true;
 }
@@ -741,6 +825,21 @@ bool InMemoryCoordinator::finish_job_attempt(
         !record->assigned_worker_id.has_value() ||
         *record->assigned_worker_id != worker_id
     ) {
+        if (record.has_value()) {
+            log_event(
+                "completion_rejected",
+                {
+                    {"job_id", attempt.job_id.value()},
+                    {
+                        "attempt",
+                        std::to_string(attempt.attempt_number)
+                    },
+                    {"worker_id", worker_id.value()},
+                    {"reason", "stale_attempt"}
+                }
+            );
+        }
+
         return false;
     }
 
@@ -759,13 +858,32 @@ bool InMemoryCoordinator::finish_job_attempt(
 
         // A completion can be retried after its response is lost.
         // Accept only an exact repeat of the stored result.
-        return
+        const bool identical_repeat =
             state == terminal_state &&
             stored.has_value() &&
             stored->outcome == result.outcome &&
             stored->exit_code == result.exit_code &&
             stored->terminating_signal == result.terminating_signal &&
             stored->diagnostic == result.diagnostic;
+
+        log_event(
+            identical_repeat
+                ? "duplicate_completion_accepted"
+                : "completion_rejected",
+            {
+                {"job_id", attempt.job_id.value()},
+                {"attempt", std::to_string(attempt.attempt_number)},
+                {"worker_id", worker_id.value()},
+                {
+                    "reason",
+                    identical_repeat
+                        ? "idempotent_retry"
+                        : "conflicting_result"
+                }
+            }
+        );
+
+        return identical_repeat;
     }
 
     if (
@@ -773,10 +891,29 @@ bool InMemoryCoordinator::finish_job_attempt(
         !record->lease_expires_at.has_value() ||
         *record->lease_expires_at <= now
     ) {
+        log_event(
+            "completion_rejected",
+            {
+                {"job_id", attempt.job_id.value()},
+                {"attempt", std::to_string(attempt.attempt_number)},
+                {"worker_id", worker_id.value()},
+                {"reason", "not_currently_running"}
+            }
+        );
+
         return false;
     }
 
     finish_job(attempt.job_id, terminal_state, result);
+
+    log_event(
+        "completion_accepted",
+        {
+            {"job_id", attempt.job_id.value()},
+            {"attempt", std::to_string(attempt.attempt_number)},
+            {"worker_id", worker_id.value()}
+        }
+    );
 
     return true;
 }
@@ -1087,6 +1224,22 @@ InMemoryCoordinator::lease_duration() const noexcept {
     return lease_duration_;
 }
 
+std::optional<domain::WorkerId>
+InMemoryCoordinator::assigned_worker(
+    const domain::JobId& job_id
+) const {
+    const auto record =
+        job_repository_.get(
+            job_id
+        );
+
+    if (!record.has_value()) {
+        return std::nullopt;
+    }
+
+    return record->assigned_worker_id;
+}
+
 std::optional<domain::WorkerSnapshot>
 InMemoryCoordinator::worker_snapshot(
     const domain::WorkerId& worker_id
@@ -1101,6 +1254,48 @@ InMemoryCoordinator::worker_snapshot(
     }
 
     return worker->snapshot();
+}
+
+std::vector<domain::WorkerSnapshot>
+InMemoryCoordinator::list_workers() const {
+    const auto workers =
+        worker_repository_.list();
+
+    std::vector<domain::WorkerSnapshot> snapshots;
+
+    snapshots.reserve(
+        workers.size()
+    );
+
+    for (const auto& worker : workers) {
+        snapshots.push_back(
+            worker.snapshot()
+        );
+    }
+
+    std::sort(
+        snapshots.begin(),
+        snapshots.end(),
+        [](
+            const domain::WorkerSnapshot& left,
+            const domain::WorkerSnapshot& right
+        ) {
+            return
+                left.id().value() <
+                right.id().value();
+        }
+    );
+
+    return snapshots;
+}
+
+std::optional<persistence::WorkerHeartbeatTimePoint>
+InMemoryCoordinator::worker_last_heartbeat(
+    const domain::WorkerId& worker_id
+) const {
+    return worker_repository_.last_heartbeat(
+        worker_id
+    );
 }
 
 bool InMemoryCoordinator::is_active_state(
@@ -1210,6 +1405,9 @@ void InMemoryCoordinator::apply_dispatch_decision(
                 persistence::JobLeaseClock::now() +
                 lease_duration_;
 
+            const auto dispatched_attempt_number =
+                stored_record->job.attempt_count();
+
             worker_repository_.update(
                 std::move(*worker)
             );
@@ -1221,6 +1419,20 @@ void InMemoryCoordinator::apply_dispatch_decision(
             );
 
             job_repository_updated = true;
+
+            log_event(
+                "attempt_dispatched",
+                {
+                    {"job_id", decision.job_id.value()},
+                    {
+                        "attempt",
+                        std::to_string(
+                            dispatched_attempt_number
+                        )
+                    },
+                    {"worker_id", decision.worker_id.value()}
+                }
+            );
         });
     } catch (...) {
         /*

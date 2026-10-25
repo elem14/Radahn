@@ -28,6 +28,7 @@
  * schedule.
  */
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -46,8 +47,10 @@
 #include "coordinator_service.hpp"
 
 #include "radahn/domain/id.hpp"
+#include "radahn/persistence/job_log_repository.hpp"
 #include "radahn/persistence/job_record.hpp"
 #include "radahn/persistence/sqlite_database.hpp"
+#include "radahn/persistence/sqlite_job_log_repository.hpp"
 #include "radahn/persistence/sqlite_job_repository.hpp"
 #include "radahn/persistence/sqlite_worker_repository.hpp"
 #include "radahn/persistence/worker_repository.hpp"
@@ -411,6 +414,822 @@ void backdate_job_lease(
 }
 
 /*
+ * Reads a stored log directly through a second connection to the
+ * same database file, bypassing the coordinator's RPC layer -
+ * exactly like backdate_worker_heartbeat/backdate_job_lease above -
+ * so a test can verify what UploadJobLog actually persisted.
+ */
+[[nodiscard]]
+std::optional<radahn::persistence::JobLogRecord>
+read_stored_log(
+    const std::filesystem::path& database_path,
+    const std::string& job_id,
+    std::uint64_t attempt_number,
+    radahn::persistence::JobLogStream stream
+) {
+    radahn::persistence::SqliteDatabase side_channel{
+        database_path
+    };
+
+    radahn::persistence::SqliteJobLogRepository
+        side_repository{side_channel};
+
+    return side_repository.get(
+        radahn::domain::JobId{job_id},
+        attempt_number,
+        stream
+    );
+}
+
+[[nodiscard]]
+grpc::Status upload_job_log(
+    rpc::WorkerService::Stub& worker,
+    const std::string& worker_id,
+    const std::string& job_id,
+    std::uint64_t attempt_number,
+    rpc::LogStream stream,
+    const std::string& content,
+    std::uint64_t original_byte_count,
+    bool truncated
+) {
+    rpc::UploadJobLogRequest request;
+
+    request.set_worker_id(worker_id);
+    request.set_job_id(job_id);
+    request.set_attempt_number(attempt_number);
+    request.set_stream(stream);
+    request.set_content(content);
+    request.set_original_byte_count(original_byte_count);
+    request.set_truncated(truncated);
+
+    rpc::UploadJobLogResponse response;
+    grpc::ClientContext context;
+    apply_deadline(context);
+
+    return worker.UploadJobLog(&context, request, &response);
+}
+
+/*
+ * 1-6. UploadJobLog: valid upload, duplicate accepted, conflicting
+ * content rejected, oversized payload rejected, not-yet-terminal
+ * rejected, and an obsolete (superseded) worker's upload rejected.
+ */
+void test_upload_job_log_lifecycle(
+    const std::filesystem::path& database_path
+) {
+    RunningCoordinator coordinator{database_path};
+
+    static_cast<void>(
+        submit_sleep_job(coordinator.client(), "job-log")
+    );
+    register_worker(coordinator.worker(), "worker-log");
+    register_worker(coordinator.worker(), "worker-log-obsolete");
+
+    const auto attempt =
+        acquire_and_start(
+            coordinator.worker(),
+            "worker-log",
+            "job-log"
+        );
+
+    // 5. Require the job to be terminal before any log is accepted.
+    const auto too_early =
+        upload_job_log(
+            coordinator.worker(),
+            "worker-log",
+            "job-log",
+            attempt,
+            rpc::LOG_STREAM_STDOUT,
+            "not yet finished",
+            16,
+            false
+        );
+
+    require(
+        too_early.error_code() ==
+            grpc::StatusCode::FAILED_PRECONDITION,
+        "UploadJobLog is rejected before the job reaches a "
+        "terminal state"
+    );
+
+    // 1. Reject oversized payloads, even before the job finishes.
+    const std::string oversized_content(
+        static_cast<std::size_t>(
+            radahn::persistence::max_job_log_bytes
+        ) + 1,
+        'x'
+    );
+
+    const auto oversized =
+        upload_job_log(
+            coordinator.worker(),
+            "worker-log",
+            "job-log",
+            attempt,
+            rpc::LOG_STREAM_STDOUT,
+            oversized_content,
+            oversized_content.size(),
+            false
+        );
+
+    require(
+        oversized.error_code() ==
+            grpc::StatusCode::INVALID_ARGUMENT,
+        "UploadJobLog rejects a payload larger than the maximum "
+        "uploaded log size"
+    );
+
+    require(
+        finish_job(
+            coordinator.worker(),
+            "worker-log",
+            "job-log",
+            attempt,
+            true
+        ).ok(),
+        "The attempt completes so its logs can now be uploaded"
+    );
+
+    // Binary content, including a NUL byte, must round-trip.
+    std::string stdout_content{"line one\n"};
+    stdout_content.push_back('\0');
+    stdout_content += "line two\n";
+
+    const auto stdout_upload =
+        upload_job_log(
+            coordinator.worker(),
+            "worker-log",
+            "job-log",
+            attempt,
+            rpc::LOG_STREAM_STDOUT,
+            stdout_content,
+            stdout_content.size(),
+            false
+        );
+
+    require(
+        stdout_upload.ok(),
+        "A valid stdout upload for the accepted, terminal attempt "
+        "is accepted"
+    );
+
+    const auto stored_stdout =
+        read_stored_log(
+            database_path,
+            "job-log",
+            attempt,
+            radahn::persistence::JobLogStream::standard_output
+        );
+
+    require(
+        stored_stdout.has_value() &&
+        stored_stdout->content == stdout_content,
+        "Binary content, including an embedded NUL byte, round-trips "
+        "exactly through the stored log"
+    );
+
+    // 2. Empty logs are distinguishable from missing logs.
+    const auto empty_stderr_upload =
+        upload_job_log(
+            coordinator.worker(),
+            "worker-log",
+            "job-log",
+            attempt,
+            rpc::LOG_STREAM_STDERR,
+            "",
+            0,
+            false
+        );
+
+    require(
+        empty_stderr_upload.ok(),
+        "An empty stderr upload is accepted"
+    );
+
+    const auto stored_stderr =
+        read_stored_log(
+            database_path,
+            "job-log",
+            attempt,
+            radahn::persistence::JobLogStream::standard_error
+        );
+
+    require(
+        stored_stderr.has_value() && stored_stderr->content.empty(),
+        "The empty stderr log is stored (present), not absent"
+    );
+
+    // 3. Duplicate uploads are safe.
+    const auto duplicate_upload =
+        upload_job_log(
+            coordinator.worker(),
+            "worker-log",
+            "job-log",
+            attempt,
+            rpc::LOG_STREAM_STDOUT,
+            stdout_content,
+            stdout_content.size(),
+            false
+        );
+
+    require(
+        duplicate_upload.ok(),
+        "An identical repeated upload is accepted"
+    );
+
+    // Reject conflicting content for an existing key.
+    const auto conflicting_upload =
+        upload_job_log(
+            coordinator.worker(),
+            "worker-log",
+            "job-log",
+            attempt,
+            rpc::LOG_STREAM_STDOUT,
+            "different content entirely",
+            26,
+            false
+        );
+
+    require(
+        conflicting_upload.error_code() ==
+            grpc::StatusCode::ALREADY_EXISTS,
+        "Conflicting content for an existing key is rejected"
+    );
+
+    const auto stored_after_conflict =
+        read_stored_log(
+            database_path,
+            "job-log",
+            attempt,
+            radahn::persistence::JobLogStream::standard_output
+        );
+
+    require(
+        stored_after_conflict.has_value() &&
+        stored_after_conflict->content == stdout_content,
+        "The rejected conflicting upload did not replace the "
+        "originally accepted content"
+    );
+
+    // 6. An obsolete worker cannot replace the accepted attempt's
+    // logs - it never held this attempt in the first place.
+    const auto obsolete_upload =
+        upload_job_log(
+            coordinator.worker(),
+            "worker-log-obsolete",
+            "job-log",
+            attempt,
+            rpc::LOG_STREAM_STDOUT,
+            stdout_content,
+            stdout_content.size(),
+            false
+        );
+
+    require(
+        obsolete_upload.error_code() ==
+            grpc::StatusCode::FAILED_PRECONDITION,
+        "A worker that never held this attempt cannot upload logs "
+        "for it"
+    );
+}
+
+/*
+ * 4. Oversized output is marked truncated, and such a record is
+ * still correctly stored and retrievable.
+ */
+void test_upload_job_log_truncation(
+    const std::filesystem::path& database_path
+) {
+    RunningCoordinator coordinator{database_path};
+
+    static_cast<void>(
+        submit_sleep_job(coordinator.client(), "job-log-truncated")
+    );
+    register_worker(coordinator.worker(), "worker-log-truncated");
+
+    const auto attempt =
+        acquire_and_start(
+            coordinator.worker(),
+            "worker-log-truncated",
+            "job-log-truncated"
+        );
+
+    require(
+        finish_job(
+            coordinator.worker(),
+            "worker-log-truncated",
+            "job-log-truncated",
+            attempt,
+            true
+        ).ok(),
+        "The attempt completes so its logs can now be uploaded"
+    );
+
+    const std::string captured_prefix(
+        static_cast<std::size_t>(
+            radahn::persistence::max_job_log_bytes
+        ),
+        'y'
+    );
+
+    const auto truncated_upload =
+        upload_job_log(
+            coordinator.worker(),
+            "worker-log-truncated",
+            "job-log-truncated",
+            attempt,
+            rpc::LOG_STREAM_STDOUT,
+            captured_prefix,
+            static_cast<std::uint64_t>(
+                radahn::persistence::max_job_log_bytes
+            ) + 4096,
+            true
+        );
+
+    require(
+        truncated_upload.ok(),
+        "A truncated upload exactly at the maximum size is accepted"
+    );
+
+    const auto stored =
+        read_stored_log(
+            database_path,
+            "job-log-truncated",
+            attempt,
+            radahn::persistence::JobLogStream::standard_output
+        );
+
+    require(
+        stored.has_value() &&
+        stored->truncated &&
+        stored->original_byte_count ==
+            radahn::persistence::max_job_log_bytes + 4096 &&
+        stored->content.size() ==
+            radahn::persistence::max_job_log_bytes,
+        "The truncated flag and true original byte count are "
+        "preserved alongside the capped content"
+    );
+}
+
+[[nodiscard]]
+rpc::GetJobResponse get_job(
+    rpc::ClientService::Stub& client,
+    const std::string& job_id
+) {
+    rpc::GetJobRequest request;
+    request.set_id(job_id);
+
+    rpc::GetJobResponse response;
+    grpc::ClientContext context;
+    apply_deadline(context);
+
+    const auto status =
+        client.GetJob(&context, request, &response);
+
+    if (!status.ok()) {
+        throw std::runtime_error{
+            "GetJob failed: " + status.error_message()
+        };
+    }
+
+    return response;
+}
+
+[[nodiscard]]
+rpc::WorkerInfo get_worker(
+    rpc::ClientService::Stub& client,
+    const std::string& worker_id
+) {
+    rpc::GetWorkerRequest request;
+    request.set_worker_id(worker_id);
+
+    rpc::GetWorkerResponse response;
+    grpc::ClientContext context;
+    apply_deadline(context);
+
+    const auto status =
+        client.GetWorker(&context, request, &response);
+
+    if (!status.ok()) {
+        throw std::runtime_error{
+            "GetWorker failed: " + status.error_message()
+        };
+    }
+
+    return response.worker();
+}
+
+[[nodiscard]]
+rpc::ListWorkersResponse list_workers(
+    rpc::ClientService::Stub& client
+) {
+    rpc::ListWorkersRequest request;
+    rpc::ListWorkersResponse response;
+    grpc::ClientContext context;
+    apply_deadline(context);
+
+    const auto status =
+        client.ListWorkers(&context, request, &response);
+
+    if (!status.ok()) {
+        throw std::runtime_error{
+            "ListWorkers failed: " + status.error_message()
+        };
+    }
+
+    return response;
+}
+
+/*
+ * Worker visibility (ListWorkers/GetWorker) and job diagnostics:
+ * active jobs show reservations, completed jobs release them, and a
+ * lost worker's status changes to offline.
+ */
+void test_worker_visibility_and_job_diagnostics(
+    const std::filesystem::path& database_path
+) {
+    RunningCoordinator coordinator{database_path};
+
+    rpc::SubmitJobRequest submit_request;
+    submit_request.set_id("job-visibility");
+    submit_request.set_name("visibility test job");
+    submit_request.set_priority(5);
+
+    auto* requirements = submit_request.mutable_requirements();
+    requirements->set_cpu_cores(2.0);
+    requirements->set_memory_bytes(256ULL * 1024 * 1024);
+    requirements->set_disk_bytes(256ULL * 1024 * 1024);
+
+    auto* workload = submit_request.mutable_workload();
+    workload->set_kind(rpc::WORKLOAD_KIND_SLEEP);
+    workload->set_sleep_duration_ms(1);
+
+    {
+        rpc::SubmitJobResponse submit_response;
+        grpc::ClientContext submit_context;
+        apply_deadline(submit_context);
+
+        require(
+            coordinator.client().SubmitJob(
+                &submit_context,
+                submit_request,
+                &submit_response
+            ).ok(),
+            "Job with explicit resource requirements is submitted"
+        );
+    }
+
+    register_worker(coordinator.worker(), "worker-visibility");
+
+    const auto before_dispatch =
+        get_worker(coordinator.client(), "worker-visibility");
+
+    require(
+        before_dispatch.online() &&
+        before_dispatch.allocated_cpu_cores() == 0.0 &&
+        before_dispatch.running_jobs() == 0,
+        "A freshly registered worker starts online with nothing "
+        "reserved"
+    );
+
+    const auto attempt =
+        acquire_and_start(
+            coordinator.worker(),
+            "worker-visibility",
+            "job-visibility"
+        );
+
+    const auto running_job =
+        get_job(coordinator.client(), "job-visibility");
+
+    require(
+        running_job.job().has_assigned_worker_id() &&
+        running_job.job().assigned_worker_id() ==
+            "worker-visibility",
+        "GetJob reports the worker currently assigned to an "
+        "active job"
+    );
+
+    require(
+        !running_job.job().stdout_log_available() &&
+        !running_job.job().stderr_log_available(),
+        "A still-running job has no uploaded logs available"
+    );
+
+    const auto during_run =
+        get_worker(coordinator.client(), "worker-visibility");
+
+    require(
+        during_run.allocated_cpu_cores() == 2.0 &&
+        during_run.running_jobs() == 1,
+        "GetWorker shows the active job's resource reservation "
+        "while it is running"
+    );
+
+    const auto listed = list_workers(coordinator.client());
+
+    const bool found_in_list =
+        std::any_of(
+            listed.workers().begin(),
+            listed.workers().end(),
+            [](const rpc::WorkerInfo& worker) {
+                return
+                    worker.worker_id() == "worker-visibility";
+            }
+        );
+
+    require(
+        found_in_list,
+        "ListWorkers includes the registered worker"
+    );
+
+    require(
+        finish_job(
+            coordinator.worker(),
+            "worker-visibility",
+            "job-visibility",
+            attempt,
+            true
+        ).ok(),
+        "The active job completes successfully"
+    );
+
+    const auto after_finish =
+        get_worker(coordinator.client(), "worker-visibility");
+
+    require(
+        after_finish.allocated_cpu_cores() == 0.0 &&
+        after_finish.running_jobs() == 0,
+        "GetWorker shows the reservation released after the job "
+        "completes"
+    );
+
+    const auto finished_job =
+        get_job(coordinator.client(), "job-visibility");
+
+    require(
+        finished_job.job().has_assigned_worker_id() &&
+        finished_job.job().assigned_worker_id() ==
+            "worker-visibility",
+        "GetJob still reports which worker completed a terminal "
+        "job"
+    );
+
+    // Worker loss changes its reported status.
+    static_cast<void>(
+        submit_sleep_job(coordinator.client(), "job-visibility-lost")
+    );
+    register_worker(coordinator.worker(), "worker-to-lose");
+
+    static_cast<void>(
+        acquire_and_start(
+            coordinator.worker(),
+            "worker-to-lose",
+            "job-visibility-lost"
+        )
+    );
+
+    backdate_worker_heartbeat(database_path, "worker-to-lose");
+    backdate_job_lease(database_path, "job-visibility-lost");
+
+    coordinator.service().run_liveness_sweep_once();
+
+    const auto lost_worker =
+        get_worker(coordinator.client(), "worker-to-lose");
+
+    require(
+        !lost_worker.online(),
+        "A worker that stops heartbeating is reported offline"
+    );
+}
+
+[[nodiscard]]
+grpc::Status get_job_log(
+    rpc::ClientService::Stub& client,
+    const std::string& job_id,
+    rpc::LogStream stream,
+    rpc::GetJobLogResponse* response
+) {
+    rpc::GetJobLogRequest request;
+
+    request.set_id(job_id);
+    request.set_stream(stream);
+
+    grpc::ClientContext context;
+    apply_deadline(context);
+
+    return client.GetJobLog(
+        &context,
+        request,
+        response
+    );
+}
+
+/*
+ * GetJobLog: retrieve distinct stdout/stderr content, distinguish
+ * "job does not exist" from "logs have not been uploaded", and
+ * confirm logs remain readable after a simulated coordinator
+ * restart.
+ */
+void test_get_job_log_retrieval_and_restart(
+    const std::filesystem::path& database_path
+) {
+    {
+        RunningCoordinator coordinator{database_path};
+
+        static_cast<void>(
+            submit_sleep_job(coordinator.client(), "job-getlog")
+        );
+        register_worker(coordinator.worker(), "worker-getlog");
+
+        const auto attempt =
+            acquire_and_start(
+                coordinator.worker(),
+                "worker-getlog",
+                "job-getlog"
+            );
+
+        require(
+            finish_job(
+                coordinator.worker(),
+                "worker-getlog",
+                "job-getlog",
+                attempt,
+                true
+            ).ok(),
+            "The attempt completes so its logs can be uploaded"
+        );
+
+        const std::string stdout_content{
+            "distinct stdout content"
+        };
+
+        const std::string stderr_content{
+            "distinct stderr content"
+        };
+
+        require(
+            upload_job_log(
+                coordinator.worker(),
+                "worker-getlog",
+                "job-getlog",
+                attempt,
+                rpc::LOG_STREAM_STDOUT,
+                stdout_content,
+                stdout_content.size(),
+                false
+            ).ok(),
+            "stdout is uploaded for the finished attempt"
+        );
+
+        require(
+            upload_job_log(
+                coordinator.worker(),
+                "worker-getlog",
+                "job-getlog",
+                attempt,
+                rpc::LOG_STREAM_STDERR,
+                stderr_content,
+                stderr_content.size(),
+                false
+            ).ok(),
+            "stderr is uploaded for the finished attempt"
+        );
+
+        rpc::GetJobLogResponse stdout_response;
+
+        const auto stdout_status =
+            get_job_log(
+                coordinator.client(),
+                "job-getlog",
+                rpc::LOG_STREAM_STDOUT,
+                &stdout_response
+            );
+
+        require(
+            stdout_status.ok() &&
+            stdout_response.content() ==
+                "distinct stdout content" &&
+            stdout_response.attempt_number() == attempt,
+            "GetJobLog retrieves the uploaded stdout content for "
+            "the job's current attempt"
+        );
+
+        rpc::GetJobLogResponse stderr_response;
+
+        const auto stderr_status =
+            get_job_log(
+                coordinator.client(),
+                "job-getlog",
+                rpc::LOG_STREAM_STDERR,
+                &stderr_response
+            );
+
+        require(
+            stderr_status.ok() &&
+            stderr_response.content() ==
+                "distinct stderr content",
+            "GetJobLog retrieves the distinct uploaded stderr "
+            "content, not the stdout content"
+        );
+
+        rpc::GetJobLogResponse missing_job_response;
+
+        const auto missing_job_status =
+            get_job_log(
+                coordinator.client(),
+                "job-getlog-does-not-exist",
+                rpc::LOG_STREAM_STDOUT,
+                &missing_job_response
+            );
+
+        require(
+            missing_job_status.error_code() ==
+                grpc::StatusCode::NOT_FOUND,
+            "GetJobLog reports NOT_FOUND for a job that does not "
+            "exist at all"
+        );
+
+        static_cast<void>(
+            submit_sleep_job(
+                coordinator.client(),
+                "job-getlog-no-upload"
+            )
+        );
+
+        register_worker(
+            coordinator.worker(),
+            "worker-getlog-no-upload"
+        );
+
+        const auto no_upload_attempt =
+            acquire_and_start(
+                coordinator.worker(),
+                "worker-getlog-no-upload",
+                "job-getlog-no-upload"
+            );
+
+        require(
+            finish_job(
+                coordinator.worker(),
+                "worker-getlog-no-upload",
+                "job-getlog-no-upload",
+                no_upload_attempt,
+                true
+            ).ok(),
+            // Finished (not left QUEUED) so it does not linger in
+            // the shared database and compete for dispatch with
+            // later tests - deliberately without ever uploading its
+            // logs, to exercise the "successful job, no logs yet"
+            // case below.
+            "A job can succeed without ever uploading its logs"
+        );
+
+        rpc::GetJobLogResponse not_uploaded_response;
+
+        const auto not_uploaded_status =
+            get_job_log(
+                coordinator.client(),
+                "job-getlog-no-upload",
+                rpc::LOG_STREAM_STDOUT,
+                &not_uploaded_response
+            );
+
+        require(
+            not_uploaded_status.error_code() ==
+                grpc::StatusCode::UNAVAILABLE,
+            "GetJobLog reports UNAVAILABLE (distinct from NOT_FOUND) "
+            "for a job that exists but has no uploaded logs yet - "
+            "a successful job is not assumed to have logs"
+        );
+
+        // RunningCoordinator's destructor shuts the server down
+        // here, simulating a coordinator process restart.
+    }
+
+    RunningCoordinator restarted_coordinator{database_path};
+
+    rpc::GetJobLogResponse response_after_restart;
+
+    const auto status_after_restart =
+        get_job_log(
+            restarted_coordinator.client(),
+            "job-getlog",
+            rpc::LOG_STREAM_STDOUT,
+            &response_after_restart
+        );
+
+    require(
+        status_after_restart.ok() &&
+        response_after_restart.content() ==
+            "distinct stdout content",
+        "A log uploaded before a coordinator restart remains "
+        "readable afterward, with no dependency on the "
+        "originating worker"
+    );
+}
+
+/*
  * 1. Start and finish a valid attempt.
  * 5. Accept an identical repeated completion.
  * 6. Reject a conflicting repeated completion.
@@ -742,6 +1561,22 @@ int main() {
         );
 
         test_recovery_after_coordinator_restart(
+            database_path
+        );
+
+        test_upload_job_log_lifecycle(
+            database_path
+        );
+
+        test_upload_job_log_truncation(
+            database_path
+        );
+
+        test_get_job_log_retrieval_and_restart(
+            database_path
+        );
+
+        test_worker_visibility_and_job_diagnostics(
             database_path
         );
     } catch (const std::exception& error) {

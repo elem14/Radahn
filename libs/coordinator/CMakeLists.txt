@@ -1,6 +1,7 @@
 add_library(
     radahn_coordinator
     STATIC
+        src/event_log.cpp
         src/in_memory_coordinator.cpp
 )
 

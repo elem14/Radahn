@@ -4,6 +4,7 @@ add_executable(
     heartbeat_loop.cpp
     active_job_registry.cpp
     completion_reporter.cpp
+    execution_log_registry.cpp
 )
 
 target_link_libraries(

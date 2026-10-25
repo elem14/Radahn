@@ -13,6 +13,7 @@
 
 #include "radahn/coordinator/in_memory_coordinator.hpp"
 #include "radahn/persistence/sqlite_database.hpp"
+#include "radahn/persistence/sqlite_job_log_repository.hpp"
 #include "radahn/persistence/sqlite_job_repository.hpp"
 #include "radahn/persistence/sqlite_worker_repository.hpp"
 #include "radahn/persistence/transaction_runner.hpp"
@@ -86,6 +87,24 @@ public:
         rpc::ListJobsResponse* response
     ) override;
 
+    grpc::Status GetJobLog(
+        grpc::ServerContext* context,
+        const rpc::GetJobLogRequest* request,
+        rpc::GetJobLogResponse* response
+    ) override;
+
+    grpc::Status ListWorkers(
+        grpc::ServerContext* context,
+        const rpc::ListWorkersRequest* request,
+        rpc::ListWorkersResponse* response
+    ) override;
+
+    grpc::Status GetWorker(
+        grpc::ServerContext* context,
+        const rpc::GetWorkerRequest* request,
+        rpc::GetWorkerResponse* response
+    ) override;
+
     grpc::Status RegisterWorker(
         grpc::ServerContext* context,
         const rpc::RegisterWorkerRequest* request,
@@ -116,6 +135,12 @@ public:
         rpc::FinishJobResponse* response
     ) override;
 
+    grpc::Status UploadJobLog(
+        grpc::ServerContext* context,
+        const rpc::UploadJobLogRequest* request,
+        rpc::UploadJobLogResponse* response
+    ) override;
+
     /*
      * Runs exactly what the background liveness thread normally
      * runs on its own schedule (mark stale workers offline, expire
@@ -142,6 +167,9 @@ private:
 
     radahn::persistence::SqliteWorkerRepository
         worker_repository_;
+
+    radahn::persistence::SqliteJobLogRepository
+        job_log_repository_;
 
     radahn::persistence::SqliteTransactionRunner
         transaction_runner_;

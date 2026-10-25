@@ -338,7 +338,7 @@ void test_version_four_migration() {
         require(
             database.query_int64(
                 "PRAGMA user_version;"
-            ) == 7,
+            ) == 8,
             "Version 5 database upgrades to the current version"
         );
 
@@ -507,8 +507,8 @@ void test_version_six_migration_expands_outcomes() {
         require(
             database.query_int64(
                 "PRAGMA user_version;"
-            ) == 7,
-            "Version 6 database upgrades to version 7"
+            ) == 8,
+            "Version 6 database upgrades to the current version"
         );
 
         require(

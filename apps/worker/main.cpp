@@ -14,6 +14,7 @@
 #include <utility>
 #include <vector>
 #include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <sstream>
 
@@ -27,6 +28,7 @@
 #include "worker_service.grpc.pb.h"
 #include "active_job_registry.hpp"
 #include "completion_reporter.hpp"
+#include "execution_log_registry.hpp"
 #include "heartbeat_loop.hpp"
 #include "radahn/domain/version.hpp"
 
@@ -262,6 +264,14 @@ struct WorkerConfig {
      * forcibly terminated.
      */
     std::chrono::milliseconds shutdown_grace_ms{10000};
+
+    /*
+     * Root directory under which every execution's captured
+     * stdout/stderr is written. Always resolved to an absolute path
+     * (see parse_worker_config) so it is unambiguous regardless of
+     * the worker's current working directory at execution time.
+     */
+    std::filesystem::path log_dir{"radahn-logs"};
 };
 
 [[nodiscard]] WorkerConfig parse_worker_config(
@@ -372,6 +382,18 @@ struct WorkerConfig {
             continue;
         }
 
+        if (argument == "--log-dir") {
+            if (index + 1 >= argc) {
+                throw std::invalid_argument{
+                    "--log-dir requires a value"
+                };
+            }
+
+            config.log_dir = argv[++index];
+
+            continue;
+        }
+
         if (argument == "--max-concurrent-jobs") {
             if (index + 1 >= argc) {
                 throw std::invalid_argument{
@@ -439,6 +461,11 @@ struct WorkerConfig {
                 config.cpu_cores
             );
     }
+
+    config.log_dir =
+        std::filesystem::absolute(
+            config.log_dir
+        );
 
     return config;
 }
@@ -598,40 +625,251 @@ grpc::Status start_job(
     );
 }
 
+/*
+ * Must match radahn::persistence::max_job_log_bytes - the
+ * coordinator rejects any upload larger than this regardless, but
+ * capping here avoids ever reading more of a local log file than
+ * could possibly be accepted.
+ */
+constexpr std::uint64_t max_job_log_bytes =
+    1024ULL * 1024ULL;
+
+struct BoundedLogContent {
+    std::string content;
+    std::uint64_t original_byte_count;
+    bool truncated;
+};
+
+/*
+ * Reads up to max_job_log_bytes from the start of `path`, preserving
+ * the true original size separately so truncation is explicit rather
+ * than silently lossy. Returns std::nullopt if the file cannot be
+ * read at all (e.g. the workload never produced it, such as a failed
+ * spawn) - that is not an upload failure, just nothing to upload.
+ */
 [[nodiscard]]
-std::filesystem::path next_command_output_directory() {
-    static std::atomic<std::uint64_t> sequence{0};
+std::optional<BoundedLogContent> read_bounded_log(
+    const std::filesystem::path& path
+) {
+    std::error_code size_error;
 
-    const auto root = std::filesystem::absolute(
-        "radahn-logs"
+    const auto file_size =
+        std::filesystem::file_size(
+            path,
+            size_error
+        );
+
+    if (size_error) {
+        return std::nullopt;
+    }
+
+    std::ifstream stream{
+        path,
+        std::ios::binary
+    };
+
+    if (!stream) {
+        return std::nullopt;
+    }
+
+    const auto to_read =
+        std::min<std::uint64_t>(
+            file_size,
+            max_job_log_bytes
+        );
+
+    std::string content(
+        static_cast<std::size_t>(to_read),
+        '\0'
     );
 
-    std::filesystem::create_directories(root);
+    if (to_read > 0) {
+        stream.read(
+            content.data(),
+            static_cast<std::streamsize>(to_read)
+        );
+    }
 
-    const auto timestamp =
-        std::chrono::steady_clock::now()
-            .time_since_epoch()
-            .count();
-
-    return root / (
-        "execution-" +
-        std::to_string(::getpid()) +
-        "-" +
-        std::to_string(timestamp) +
-        "-" +
-        std::to_string(
-            sequence.fetch_add(
-                1,
-                std::memory_order_relaxed
-            )
-        )
-    );
+    return BoundedLogContent{
+        std::move(content),
+        file_size,
+        file_size > max_job_log_bytes
+    };
 }
 
 [[nodiscard]]
-radahn::domain::ExecutionResult execute_command_job(
+grpc::Status upload_job_log_once(
+    rpc::WorkerService::Stub& stub,
+    const std::string& worker_id,
+    const std::string& job_id,
+    std::uint64_t attempt_number,
+    rpc::LogStream stream,
+    const BoundedLogContent& content
+) {
+    rpc::UploadJobLogRequest request;
+
+    request.set_worker_id(worker_id);
+    request.set_job_id(job_id);
+    request.set_attempt_number(attempt_number);
+    request.set_stream(stream);
+    request.set_content(content.content);
+    request.set_original_byte_count(content.original_byte_count);
+    request.set_truncated(content.truncated);
+
+    rpc::UploadJobLogResponse response;
+    grpc::ClientContext context;
+
+    context.set_deadline(
+        std::chrono::system_clock::now() +
+        std::chrono::seconds{5}
+    );
+
+    return stub.UploadJobLog(
+        &context,
+        request,
+        &response
+    );
+}
+
+/*
+ * Retries a transient upload failure with bounded exponential
+ * backoff over a bounded total interval. A rejection the coordinator
+ * considers definitive (the attempt is no longer the accepted one,
+ * the content conflicts with what is already stored, or the request
+ * itself is malformed) is not retried - none of those become true
+ * merely by trying again. Local files are never deleted here, win or
+ * lose: an upload failure must not change an already-accepted job
+ * result, and the operator can always recover the output from disk.
+ */
+void upload_job_log_with_retry(
+    rpc::WorkerService::Stub& stub,
+    const std::string& worker_id,
+    const std::string& job_id,
+    std::uint64_t attempt_number,
+    rpc::LogStream stream,
+    const BoundedLogContent& content
+) {
+    constexpr std::chrono::milliseconds
+        upload_deadline_budget{30000};
+
+    const auto deadline =
+        std::chrono::steady_clock::now() +
+        upload_deadline_budget;
+
+    std::chrono::milliseconds backoff{250};
+
+    constexpr std::chrono::milliseconds
+        max_backoff{2000};
+
+    while (true) {
+        const auto status =
+            upload_job_log_once(
+                stub,
+                worker_id,
+                job_id,
+                attempt_number,
+                stream,
+                content
+            );
+
+        if (status.ok()) {
+            return;
+        }
+
+        const bool definitive =
+            status.error_code() ==
+                grpc::StatusCode::ALREADY_EXISTS ||
+            status.error_code() ==
+                grpc::StatusCode::FAILED_PRECONDITION ||
+            status.error_code() ==
+                grpc::StatusCode::INVALID_ARGUMENT ||
+            status.error_code() ==
+                grpc::StatusCode::NOT_FOUND;
+
+        if (
+            definitive ||
+            std::chrono::steady_clock::now() >= deadline
+        ) {
+            write_log(
+                std::cerr,
+                "event=log_upload_failed job_id=" + job_id +
+                " attempt=" + std::to_string(attempt_number) +
+                " worker_id=" + worker_id +
+                " reason=" +
+                (
+                    definitive
+                        ? std::string{"rejected"}
+                        : std::string{"deadline_exceeded"}
+                )
+            );
+
+            return;
+        }
+
+        std::this_thread::sleep_for(backoff);
+
+        backoff = std::min(
+            backoff * 2,
+            max_backoff
+        );
+    }
+}
+
+void upload_execution_logs(
+    rpc::WorkerService::Stub& stub,
+    const radahn::worker_app::ExecutionLogRecord& record
+) {
+    if (record.stdout_path.has_value()) {
+        const auto content =
+            read_bounded_log(*record.stdout_path);
+
+        if (content.has_value()) {
+            upload_job_log_with_retry(
+                stub,
+                record.worker_id,
+                record.job_id,
+                record.attempt_number,
+                rpc::LOG_STREAM_STDOUT,
+                *content
+            );
+        }
+    }
+
+    if (record.stderr_path.has_value()) {
+        const auto content =
+            read_bounded_log(*record.stderr_path);
+
+        if (content.has_value()) {
+            upload_job_log_with_retry(
+                stub,
+                record.worker_id,
+                record.job_id,
+                record.attempt_number,
+                rpc::LOG_STREAM_STDERR,
+                *content
+            );
+        }
+    }
+}
+
+/*
+ * The outcome of running one job's workload, together with the local
+ * paths (if any) its captured output was written to - absent for a
+ * workload that has no subprocess output at all (the internal sleep
+ * workload).
+ */
+struct JobExecutionOutcome {
+    radahn::domain::ExecutionResult result;
+    std::optional<std::filesystem::path> output_directory;
+    std::optional<std::filesystem::path> stdout_path;
+    std::optional<std::filesystem::path> stderr_path;
+};
+
+[[nodiscard]]
+JobExecutionOutcome execute_command_job(
     const rpc::JobInfo& job,
-    const radahn::worker_app::AttemptControlPtr& control
+    const radahn::worker_app::AttemptControlPtr& control,
+    const std::filesystem::path& log_dir
 ) {
     const auto workload =
         radahn::rpc_codec::decode_workload(
@@ -639,7 +877,10 @@ radahn::domain::ExecutionResult execute_command_job(
         );
 
     const auto output_directory =
-        next_command_output_directory();
+        radahn::worker_app::
+            next_execution_output_directory(
+                log_dir
+            );
 
     write_log(
         std::cout,
@@ -690,7 +931,24 @@ radahn::domain::ExecutionResult execute_command_job(
         output.str()
     );
 
-    return result;
+    if (
+        result.outcome ==
+        radahn::domain::ExecutionOutcome::timed_out
+    ) {
+        write_log(
+            std::cout,
+            "event=timeout job_id=" + job.id() +
+            " attempt=" +
+            std::to_string(job.attempt_count())
+        );
+    }
+
+    return JobExecutionOutcome{
+        result,
+        output_directory,
+        output_directory / "stdout.log",
+        output_directory / "stderr.log"
+    };
 }
 
 
@@ -702,7 +960,7 @@ radahn::domain::ExecutionResult execute_command_job(
  * than letting it run to completion regardless.
  */
 [[nodiscard]]
-radahn::domain::ExecutionResult execute_sleep_job(
+JobExecutionOutcome execute_sleep_job(
     std::chrono::milliseconds duration,
     const radahn::worker_app::AttemptControlPtr& control
 ) {
@@ -716,12 +974,17 @@ radahn::domain::ExecutionResult execute_sleep_job(
         std::chrono::milliseconds::zero()
     ) {
         if (control->stop_was_requested()) {
-            return radahn::domain::ExecutionResult{
-                radahn::domain::ExecutionOutcome::
-                    worker_stopped,
+            return JobExecutionOutcome{
+                radahn::domain::ExecutionResult{
+                    radahn::domain::ExecutionOutcome::
+                        worker_stopped,
+                    std::nullopt,
+                    std::nullopt,
+                    "Worker stopped execution"
+                },
                 std::nullopt,
                 std::nullopt,
-                "Worker stopped execution"
+                std::nullopt
             };
         }
 
@@ -739,18 +1002,24 @@ radahn::domain::ExecutionResult execute_sleep_job(
     }
 
     // Successful completion is represented as exit code 0.
-    return radahn::domain::ExecutionResult{
-        radahn::domain::ExecutionOutcome::exited,
-        0,
+    return JobExecutionOutcome{
+        radahn::domain::ExecutionResult{
+            radahn::domain::ExecutionOutcome::exited,
+            0,
+            std::nullopt,
+            {}
+        },
         std::nullopt,
-        {}
+        std::nullopt,
+        std::nullopt
     };
 }
 
 [[nodiscard]]
-radahn::domain::ExecutionResult execute_job(
+JobExecutionOutcome execute_job(
     const rpc::JobInfo& job,
-    const radahn::worker_app::AttemptControlPtr& control
+    const radahn::worker_app::AttemptControlPtr& control,
+    const std::filesystem::path& log_dir
 ) {
     if (!job.has_workload()) {
         throw std::invalid_argument{
@@ -762,7 +1031,7 @@ radahn::domain::ExecutionResult execute_job(
         job.workload().kind() ==
         rpc::WORKLOAD_KIND_COMMAND
     ) {
-        return execute_command_job(job, control);
+        return execute_command_job(job, control, log_dir);
     }
 
     const auto workload =
@@ -818,7 +1087,8 @@ int main(int argc, char* argv[]) {
             << " [--gpu]"
             << " [--tag <tag>]..."
             << " [--max-concurrent-jobs <n>]"
-            << " [--shutdown-grace-ms <n>]\n";
+            << " [--shutdown-grace-ms <n>]"
+            << " [--log-dir <directory>]\n";
 
         return 1;
     }
@@ -872,6 +1142,9 @@ int main(int argc, char* argv[]) {
 
     radahn::worker_app::ActiveJobRegistry
         active_jobs;
+
+    radahn::worker_app::ExecutionLogRegistry
+        execution_logs;
 
     radahn::worker_app::HeartbeatLoop
         heartbeat_loop{
@@ -1085,28 +1358,40 @@ int main(int argc, char* argv[]) {
                     [
                         &stub_ref = *stub,
                         &active_jobs,
+                        &execution_logs,
                         worker_id = config.worker_id,
                         job_id,
                         attempt_number,
                         job_info,
-                        control
+                        control,
+                        log_dir = config.log_dir
                     ]() {
 
-                        radahn::domain::ExecutionResult result{
-                            radahn::domain::ExecutionOutcome::worker_error,
-                            std::nullopt,
-                            std::nullopt,
-                            "Execution did not complete"
-                        };
-
-                        try {
-                            result = execute_job(job_info, control);
-                        } catch (const std::exception& error) {
-                            result = radahn::domain::ExecutionResult{
+                        JobExecutionOutcome outcome{
+                            radahn::domain::ExecutionResult{
                                 radahn::domain::ExecutionOutcome::worker_error,
                                 std::nullopt,
                                 std::nullopt,
-                                error.what()
+                                "Execution did not complete"
+                            },
+                            std::nullopt,
+                            std::nullopt,
+                            std::nullopt
+                        };
+
+                        try {
+                            outcome = execute_job(job_info, control, log_dir);
+                        } catch (const std::exception& error) {
+                            outcome = JobExecutionOutcome{
+                                radahn::domain::ExecutionResult{
+                                    radahn::domain::ExecutionOutcome::worker_error,
+                                    std::nullopt,
+                                    std::nullopt,
+                                    error.what()
+                                },
+                                std::nullopt,
+                                std::nullopt,
+                                std::nullopt
                             };
 
                             write_log(
@@ -1129,13 +1414,27 @@ int main(int argc, char* argv[]) {
                                 AttemptPhase::reporting
                         );
 
+                        execution_logs.record(
+                            radahn::worker_app::ExecutionLogRecord{
+                                job_id,
+                                attempt_number,
+                                worker_id,
+                                outcome.output_directory.value_or(
+                                    std::filesystem::path{}
+                                ),
+                                outcome.stdout_path,
+                                outcome.stderr_path,
+                                outcome.result
+                            }
+                        );
+
                         radahn::worker_app::PendingCompletion
                             pending{
                                 radahn::worker_app::CompletionRecord{
                                     worker_id,
                                     job_id,
                                     attempt_number,
-                                    result
+                                    outcome.result
                                 },
                                 radahn::worker_app::
                                     CompletionPhase::reporting
@@ -1178,11 +1477,35 @@ int main(int argc, char* argv[]) {
                                     << job_id
                                     << " completed with state "
                                     << (
-                                        result.succeeded()
+                                        outcome.result.succeeded()
                                             ? "SUCCEEDED"
                                             : "FAILED"
                                     )
                                     << '\n';
+
+                                write_log(
+                                    std::cout,
+                                    "event=completion_accepted job_id=" +
+                                    job_id + " attempt=" +
+                                    std::to_string(attempt_number) +
+                                    " worker_id=" + worker_id
+                                );
+
+                                {
+                                    const auto log_record =
+                                        execution_logs.find(
+                                            job_id,
+                                            attempt_number
+                                        );
+
+                                    if (log_record.has_value()) {
+                                        upload_execution_logs(
+                                            stub_ref,
+                                            *log_record
+                                        );
+                                    }
+                                }
+
                                 break;
 
                             case radahn::worker_app::
@@ -1248,6 +1571,14 @@ int main(int argc, char* argv[]) {
         << " in-flight job(s) (grace "
         << config.shutdown_grace_ms.count()
         << "ms)...\n";
+
+    write_log(
+        std::cout,
+        "event=shutdown_started worker_id=" +
+        config.worker_id +
+        " in_flight_jobs=" +
+        std::to_string(running_jobs.size())
+    );
 
     /*
      * Bounded graceful-shutdown policy:
@@ -1367,6 +1698,12 @@ int main(int argc, char* argv[]) {
     std::cout
         << "All in-flight jobs finished;"
         << " shutting down\n";
+
+    write_log(
+        std::cout,
+        "event=shutdown_completed worker_id=" +
+        config.worker_id
+    );
 
     return 0;
 }

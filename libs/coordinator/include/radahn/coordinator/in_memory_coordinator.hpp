@@ -189,9 +189,30 @@ public:
         const domain::WorkerId& worker_id
     ) const;
 
+    // The worker currently (or, for a terminal job, most recently)
+    // assigned to this job. Unlike leased_job_for_worker, this is not
+    // restricted to the LEASED state - it reflects JobRecord-level
+    // assignment, which survives through RUNNING and into a terminal
+    // state (see InMemoryCoordinator::finish_job).
+    [[nodiscard]]
+    std::optional<domain::WorkerId>
+    assigned_worker(
+        const domain::JobId& job_id
+    ) const;
+
     [[nodiscard]]
     std::optional<domain::WorkerSnapshot>
     worker_snapshot(
+        const domain::WorkerId& worker_id
+    ) const;
+
+    [[nodiscard]]
+    std::vector<domain::WorkerSnapshot>
+    list_workers() const;
+
+    [[nodiscard]]
+    std::optional<persistence::WorkerHeartbeatTimePoint>
+    worker_last_heartbeat(
         const domain::WorkerId& worker_id
     ) const;
 

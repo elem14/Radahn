@@ -8,10 +8,12 @@ add_library(
     radahn_persistence
     STATIC
         src/in_memory_job_repository.cpp
+        src/in_memory_job_log_repository.cpp
         src/in_memory_worker_repository.cpp
         src/sqlite_database.cpp
         src/sqlite_schema.cpp
         src/sqlite_job_repository.cpp
+        src/sqlite_job_log_repository.cpp
         src/sqlite_worker_repository.cpp
         src/transaction_runner.cpp
 )

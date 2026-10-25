@@ -14,6 +14,15 @@ service ClientService {
 
   rpc ListJobs(ListJobsRequest)
       returns (ListJobsResponse);
+
+  rpc GetJobLog(GetJobLogRequest)
+      returns (GetJobLogResponse);
+
+  rpc ListWorkers(ListWorkersRequest)
+      returns (ListWorkersResponse);
+
+  rpc GetWorker(GetWorkerRequest)
+      returns (GetWorkerResponse);
 }
 
 message PingRequest {
@@ -63,6 +72,12 @@ message WorkloadSpec {
   CommandWorkload command = 3;
 }
 
+enum LogStream {
+  LOG_STREAM_UNSPECIFIED = 0;
+  LOG_STREAM_STDOUT = 1;
+  LOG_STREAM_STDERR = 2;
+}
+
 enum ExecutionOutcome {
   EXECUTION_OUTCOME_UNSPECIFIED = 0;
   EXECUTION_OUTCOME_EXITED = 1;
@@ -91,6 +106,17 @@ message JobInfo {
   uint64 attempt_count = 8;
   uint64 max_attempts = 9;
   ExecutionResult execution_result = 10;
+
+  // The worker currently (or, for a terminal job, most recently)
+  // assigned to this job. Unset when the job has never been
+  // dispatched to any worker.
+  optional string assigned_worker_id = 11;
+
+  // Whether a stdout/stderr log has been uploaded for this job's
+  // current/latest attempt - never implies the job succeeded, and a
+  // successful job is not assumed to have uploaded logs yet.
+  bool stdout_log_available = 12;
+  bool stderr_log_available = 13;
 }
 
 message SubmitJobRequest {
@@ -119,4 +145,60 @@ message ListJobsRequest {
 
 message ListJobsResponse {
   repeated JobInfo jobs = 1;
+}
+
+message GetJobLogRequest {
+  string id = 1;
+
+  // Defaults to LOG_STREAM_STDOUT when unspecified.
+  LogStream stream = 2;
+
+  // 0 (the default) means "the job's current/latest attempt".
+  uint64 attempt_number = 3;
+}
+
+message GetJobLogResponse {
+  bytes content = 1;
+  uint64 attempt_number = 2;
+  uint64 original_byte_count = 3;
+  bool truncated = 4;
+}
+
+message WorkerInfo {
+  string worker_id = 1;
+  bool online = 2;
+
+  // 0 when this worker has never heartbeat.
+  int64 last_heartbeat_unix_ms = 3;
+
+  double total_cpu_cores = 4;
+  double allocated_cpu_cores = 5;
+
+  uint64 total_memory_bytes = 6;
+  uint64 allocated_memory_bytes = 7;
+
+  uint64 total_disk_bytes = 8;
+  uint64 allocated_disk_bytes = 9;
+
+  uint64 running_jobs = 10;
+  uint64 max_concurrent_jobs = 11;
+
+  bool gpu_available = 12;
+
+  repeated string tags = 13;
+}
+
+message ListWorkersRequest {
+}
+
+message ListWorkersResponse {
+  repeated WorkerInfo workers = 1;
+}
+
+message GetWorkerRequest {
+  string worker_id = 1;
+}
+
+message GetWorkerResponse {
+  WorkerInfo worker = 1;
 }

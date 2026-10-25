@@ -66,8 +66,8 @@ void test_schema_creation() {
     expect(
         database.query_int64(
             "PRAGMA user_version;"
-        ) == 7,
-        "SQLite schema version is seven"
+        ) == 8,
+        "SQLite schema version is eight"
     );
 
     expect(

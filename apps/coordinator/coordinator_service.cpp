@@ -13,6 +13,7 @@
 
 #include "workload_codec.hpp"
 
+#include "radahn/coordinator/event_log.hpp"
 #include "radahn/domain/id.hpp"
 #include "radahn/domain/job.hpp"
 #include "radahn/domain/job_state.hpp"
@@ -78,6 +79,17 @@ void fill_workload_info(
 }
 
 /*
+ * JobRecord-level information fill_job_info cannot read off a
+ * domain::Job alone - gathered under the coordinator mutex by
+ * CoordinatorServiceImpl::job_info_extras_locked before formatting.
+ */
+struct JobInfoExtras {
+    std::optional<domain::WorkerId> assigned_worker_id;
+    bool stdout_log_available = false;
+    bool stderr_log_available = false;
+};
+
+/*
  * Fill a protobuf JobInfo message from a domain Job
  *
  * This helper is reused by SubmitJob, GetJob, ListJobs,
@@ -85,6 +97,7 @@ void fill_workload_info(
  */
 void fill_job_info(
     const domain::Job& job,
+    const JobInfoExtras& extras,
     rpc::JobInfo* output
 ) {
     output->set_id(
@@ -171,6 +184,139 @@ void fill_job_info(
             *output->mutable_execution_result()
         );
     }
+
+    if (extras.assigned_worker_id.has_value()) {
+        output->set_assigned_worker_id(
+            extras.assigned_worker_id->value()
+        );
+    } else {
+        output->clear_assigned_worker_id();
+    }
+
+    output->set_stdout_log_available(
+        extras.stdout_log_available
+    );
+
+    output->set_stderr_log_available(
+        extras.stderr_log_available
+    );
+}
+
+/*
+ * Fill a protobuf WorkerInfo message from a worker snapshot and its
+ * last known heartbeat.
+ */
+void fill_worker_info(
+    const domain::WorkerSnapshot& snapshot,
+    const std::optional<
+        radahn::persistence::WorkerHeartbeatTimePoint
+    >& last_heartbeat,
+    rpc::WorkerInfo* output
+) {
+    output->set_worker_id(
+        snapshot.id().value()
+    );
+
+    output->set_online(
+        snapshot.state() ==
+        domain::WorkerState::online
+    );
+
+    output->set_last_heartbeat_unix_ms(
+        last_heartbeat.has_value()
+            ? std::chrono::duration_cast<
+                  std::chrono::milliseconds
+              >(
+                  last_heartbeat->time_since_epoch()
+              ).count()
+            : 0
+    );
+
+    const auto& resources = snapshot.resources();
+
+    output->set_total_cpu_cores(
+        resources.total_cpu_cores()
+    );
+
+    output->set_allocated_cpu_cores(
+        resources.total_cpu_cores() -
+        resources.available_cpu_cores()
+    );
+
+    output->set_total_memory_bytes(
+        resources.total_memory_bytes()
+    );
+
+    output->set_allocated_memory_bytes(
+        resources.total_memory_bytes() -
+        resources.available_memory_bytes()
+    );
+
+    output->set_total_disk_bytes(
+        resources.total_disk_bytes()
+    );
+
+    output->set_allocated_disk_bytes(
+        resources.total_disk_bytes() -
+        resources.available_disk_bytes()
+    );
+
+    output->set_running_jobs(
+        static_cast<std::uint64_t>(
+            snapshot.running_jobs()
+        )
+    );
+
+    output->set_max_concurrent_jobs(
+        static_cast<std::uint64_t>(
+            snapshot.max_concurrent_jobs()
+        )
+    );
+
+    output->set_gpu_available(
+        resources.gpu_available()
+    );
+
+    output->clear_tags();
+
+    for (const auto& tag : snapshot.tags()) {
+        output->add_tags(tag);
+    }
+}
+
+/*
+ * Gathers JobRecord-level extras (assigned worker, log availability)
+ * for `job`. Callers must already hold the coordinator mutex -
+ * formatting the gathered snapshot into a response happens outside
+ * the lock, at each call site.
+ */
+[[nodiscard]] JobInfoExtras job_info_extras(
+    const radahn::coordinator::InMemoryCoordinator& coordinator,
+    const radahn::persistence::IJobLogRepository& job_log_repository,
+    const domain::Job& job
+) {
+    JobInfoExtras extras;
+
+    extras.assigned_worker_id =
+        coordinator.assigned_worker(
+            job.id()
+        );
+
+    extras.stdout_log_available =
+        job_log_repository.contains(
+            job.id(),
+            job.attempt_count(),
+            radahn::persistence::JobLogStream::standard_output
+        );
+
+    extras.stderr_log_available =
+        job_log_repository.contains(
+            job.id(),
+            job.attempt_count(),
+            radahn::persistence::JobLogStream::standard_error
+        );
+
+    return extras;
 }
 
 /*
@@ -230,6 +376,36 @@ copy_worker_tags(
     return tags;
 }
 
+[[nodiscard]] bool is_terminal_job_state(
+    domain::JobState state
+) noexcept {
+    return
+        state == domain::JobState::succeeded ||
+        state == domain::JobState::failed ||
+        state == domain::JobState::cancelled;
+}
+
+[[nodiscard]] radahn::persistence::JobLogStream
+to_persistence_log_stream(
+    rpc::LogStream stream
+) {
+    switch (stream) {
+        case rpc::LOG_STREAM_STDOUT:
+            return radahn::persistence::
+                JobLogStream::standard_output;
+
+        case rpc::LOG_STREAM_STDERR:
+            return radahn::persistence::
+                JobLogStream::standard_error;
+
+        case rpc::LOG_STREAM_UNSPECIFIED:
+        default:
+            throw std::invalid_argument{
+                "A valid log stream is required"
+            };
+    }
+}
+
 /*
  * Safely convert a protobuf uint64 into size_t
  */
@@ -260,6 +436,7 @@ CoordinatorServiceImpl::CoordinatorServiceImpl(
     : database_{database_path},
     job_repository_{database_},
     worker_repository_{database_},
+    job_log_repository_{database_},
     transaction_runner_{database_},
     coordinator_{
         policy_,
@@ -276,6 +453,8 @@ CoordinatorServiceImpl::CoordinatorServiceImpl(
 }
 
 CoordinatorServiceImpl::~CoordinatorServiceImpl() {
+    radahn::coordinator::log_event("shutdown_started");
+
     stop_liveness_monitor_.store(
         true
     );
@@ -285,6 +464,8 @@ CoordinatorServiceImpl::~CoordinatorServiceImpl() {
     if (liveness_thread_.joinable()) {
         liveness_thread_.join();
     }
+
+    radahn::coordinator::log_event("shutdown_completed");
 }
 
 grpc::Status CoordinatorServiceImpl::Ping(
@@ -375,6 +556,8 @@ grpc::Status CoordinatorServiceImpl::SubmitJob(
             max_attempts
         };
 
+        JobInfoExtras extras;
+
         {
             const std::lock_guard lock{mutex_};
 
@@ -390,10 +573,24 @@ grpc::Status CoordinatorServiceImpl::SubmitJob(
             }
 
             coordinator_.submit_job(job);
+
+            extras = job_info_extras(
+                coordinator_,
+                job_log_repository_,
+                job
+            );
         }
+
+        radahn::coordinator::log_event(
+            "job_submitted",
+            {
+                {"job_id", job_id.value()}
+            }
+        );
 
         fill_job_info(
             job,
+            extras,
             response->mutable_job()
         );
 
@@ -424,6 +621,7 @@ grpc::Status CoordinatorServiceImpl::GetJob(
         };
 
         std::optional<domain::Job> job;
+        JobInfoExtras extras;
 
         {
             const std::lock_guard lock{mutex_};
@@ -431,6 +629,14 @@ grpc::Status CoordinatorServiceImpl::GetJob(
             job = coordinator_.get_job(
                 job_id
             );
+
+            if (job.has_value()) {
+                extras = job_info_extras(
+                    coordinator_,
+                    job_log_repository_,
+                    *job
+                );
+            }
         }
 
         if (!job.has_value()) {
@@ -442,6 +648,7 @@ grpc::Status CoordinatorServiceImpl::GetJob(
 
         fill_job_info(
             *job,
+            extras,
             response->mutable_job()
         );
 
@@ -469,21 +676,128 @@ grpc::Status CoordinatorServiceImpl::ListJobs(
 
     try {
         std::vector<domain::Job> jobs;
+        std::vector<JobInfoExtras> extras;
 
         {
             const std::lock_guard lock{mutex_};
 
             jobs = coordinator_.list_jobs();
+
+            extras.reserve(jobs.size());
+
+            for (const auto& job : jobs) {
+                extras.push_back(
+                    job_info_extras(
+                        coordinator_,
+                        job_log_repository_,
+                        job
+                    )
+                );
+            }
         }
 
-        for (const auto& job : jobs) {
+        for (std::size_t index = 0; index < jobs.size(); ++index) {
             fill_job_info(
-                job,
+                jobs[index],
+                extras[index],
                 response->add_jobs()
             );
         }
 
         return grpc::Status::OK;
+    } catch (const std::exception& error) {
+        return grpc::Status{
+            grpc::StatusCode::INTERNAL,
+            error.what()
+        };
+    }
+}
+
+grpc::Status CoordinatorServiceImpl::GetJobLog(
+    grpc::ServerContext* context,
+    const rpc::GetJobLogRequest* request,
+    rpc::GetJobLogResponse* response
+) {
+    static_cast<void>(context);
+
+    try {
+        const domain::JobId job_id{
+            request->id()
+        };
+
+        const auto stream =
+            to_persistence_log_stream(
+                request->stream() ==
+                    rpc::LOG_STREAM_UNSPECIFIED
+                    ? rpc::LOG_STREAM_STDOUT
+                    : request->stream()
+            );
+
+        std::optional<domain::Job> job;
+        std::optional<radahn::persistence::JobLogRecord> log;
+
+        {
+            const std::lock_guard lock{mutex_};
+
+            job = coordinator_.get_job(job_id);
+
+            if (!job.has_value()) {
+                return grpc::Status{
+                    grpc::StatusCode::NOT_FOUND,
+                    "Job was not found"
+                };
+            }
+
+            const std::uint64_t attempt_number =
+                request->attempt_number() == 0
+                    ? static_cast<std::uint64_t>(
+                          job->attempt_count()
+                      )
+                    : request->attempt_number();
+
+            if (attempt_number == 0) {
+                return grpc::Status{
+                    grpc::StatusCode::UNAVAILABLE,
+                    "Logs have not been uploaded for this job "
+                    "(it has not been attempted yet)"
+                };
+            }
+
+            log = job_log_repository_.get(
+                job_id,
+                attempt_number,
+                stream
+            );
+
+            if (!log.has_value()) {
+                return grpc::Status{
+                    grpc::StatusCode::UNAVAILABLE,
+                    "Logs have not been uploaded for this "
+                    "attempt and stream"
+                };
+            }
+        }
+
+        response->set_content(log->content);
+
+        response->set_attempt_number(
+            log->attempt_number
+        );
+
+        response->set_original_byte_count(
+            log->original_byte_count
+        );
+
+        response->set_truncated(
+            log->truncated
+        );
+
+        return grpc::Status::OK;
+    } catch (const std::invalid_argument& error) {
+        return grpc::Status{
+            grpc::StatusCode::INVALID_ARGUMENT,
+            error.what()
+        };
     } catch (const std::exception& error) {
         return grpc::Status{
             grpc::StatusCode::INTERNAL,
@@ -574,6 +888,19 @@ grpc::Status CoordinatorServiceImpl::RegisterWorker(
                 radahn::persistence::WorkerHeartbeatClock::now()
             );
         }
+
+        radahn::coordinator::log_event(
+            "worker_registered",
+            {
+                {"worker_id", worker_id.value()},
+                {
+                    "already_registered",
+                    already_registered
+                        ? std::string{"true"}
+                        : std::string{"false"}
+                }
+            }
+        );
 
         response->set_worker_id(
             worker_id.value()
@@ -766,6 +1093,7 @@ grpc::Status CoordinatorServiceImpl::AcquireJob(
         };
 
         std::optional<domain::Job> assigned_job;
+        JobInfoExtras extras;
 
         {
             const std::lock_guard lock{mutex_};
@@ -800,6 +1128,14 @@ grpc::Status CoordinatorServiceImpl::AcquireJob(
                             worker_id
                         );
             }
+
+            if (assigned_job.has_value()) {
+                extras = job_info_extras(
+                    coordinator_,
+                    job_log_repository_,
+                    *assigned_job
+                );
+            }
         }
 
         if (!assigned_job.has_value()) {
@@ -808,6 +1144,7 @@ grpc::Status CoordinatorServiceImpl::AcquireJob(
 
         fill_job_info(
             *assigned_job,
+            extras,
             response->mutable_job()
         );
 
@@ -854,6 +1191,7 @@ grpc::Status CoordinatorServiceImpl::StartJob(
         };
 
         std::optional<domain::Job> job;
+        JobInfoExtras extras;
 
         {
             const std::lock_guard lock{mutex_};
@@ -875,6 +1213,14 @@ grpc::Status CoordinatorServiceImpl::StartJob(
             job = coordinator_.get_job(
                 job_id
             );
+
+            if (job.has_value()) {
+                extras = job_info_extras(
+                    coordinator_,
+                    job_log_repository_,
+                    *job
+                );
+            }
         }
 
         if (!job.has_value()) {
@@ -886,6 +1232,7 @@ grpc::Status CoordinatorServiceImpl::StartJob(
 
         fill_job_info(
             *job,
+            extras,
             response->mutable_job()
         );
 
@@ -973,6 +1320,7 @@ grpc::Status CoordinatorServiceImpl::FinishJob(
         };
 
         std::optional<domain::Job> job;
+        JobInfoExtras extras;
 
         {
             const std::lock_guard lock{mutex_};
@@ -995,6 +1343,14 @@ grpc::Status CoordinatorServiceImpl::FinishJob(
             job = coordinator_.get_job(
                 job_id
             );
+
+            if (job.has_value()) {
+                extras = job_info_extras(
+                    coordinator_,
+                    job_log_repository_,
+                    *job
+                );
+            }
         }
 
         if (!job.has_value()) {
@@ -1006,7 +1362,302 @@ grpc::Status CoordinatorServiceImpl::FinishJob(
 
         fill_job_info(
             *job,
+            extras,
             response->mutable_job()
+        );
+
+        return grpc::Status::OK;
+    } catch (const std::invalid_argument& error) {
+        return grpc::Status{
+            grpc::StatusCode::INVALID_ARGUMENT,
+            error.what()
+        };
+    } catch (const std::exception& error) {
+        return grpc::Status{
+            grpc::StatusCode::INTERNAL,
+            error.what()
+        };
+    }
+}
+
+grpc::Status CoordinatorServiceImpl::UploadJobLog(
+    grpc::ServerContext* context,
+    const rpc::UploadJobLogRequest* request,
+    rpc::UploadJobLogResponse* response
+) {
+    static_cast<void>(context);
+    static_cast<void>(response);
+
+    try {
+        if (
+            request->worker_id().empty() ||
+            request->job_id().empty()
+        ) {
+            return grpc::Status{
+                grpc::StatusCode::INVALID_ARGUMENT,
+                "worker_id and job_id are required"
+            };
+        }
+
+        if (request->attempt_number() == 0) {
+            return grpc::Status{
+                grpc::StatusCode::INVALID_ARGUMENT,
+                "attempt_number must be positive"
+            };
+        }
+
+        if (
+            request->content().size() >
+            radahn::persistence::max_job_log_bytes
+        ) {
+            return grpc::Status{
+                grpc::StatusCode::INVALID_ARGUMENT,
+                "Log content exceeds the maximum uploaded size"
+            };
+        }
+
+        if (request->truncated()) {
+            if (
+                request->original_byte_count() <=
+                request->content().size()
+            ) {
+                return grpc::Status{
+                    grpc::StatusCode::INVALID_ARGUMENT,
+                    "A truncated log must report an original "
+                    "byte count larger than its uploaded content"
+                };
+            }
+        } else if (
+            request->original_byte_count() !=
+            request->content().size()
+        ) {
+            return grpc::Status{
+                grpc::StatusCode::INVALID_ARGUMENT,
+                "original_byte_count must match the uploaded "
+                "content size when not truncated"
+            };
+        }
+
+        const radahn::persistence::JobLogStream stream =
+            to_persistence_log_stream(
+                request->stream()
+            );
+
+        const domain::JobId job_id{
+            request->job_id()
+        };
+
+        const domain::WorkerId worker_id{
+            request->worker_id()
+        };
+
+        radahn::persistence::JobLogRecord record{
+            job_id,
+            request->attempt_number(),
+            stream,
+            worker_id,
+            request->content(),
+            request->original_byte_count(),
+            request->truncated()
+        };
+
+        const std::lock_guard lock{mutex_};
+
+        const auto job = coordinator_.get_job(job_id);
+
+        if (!job.has_value()) {
+            return grpc::Status{
+                grpc::StatusCode::NOT_FOUND,
+                "Job was not found"
+            };
+        }
+
+        if (!is_terminal_job_state(job->state())) {
+            return grpc::Status{
+                grpc::StatusCode::FAILED_PRECONDITION,
+                "Job has not reached a terminal state"
+            };
+        }
+
+        if (
+            job->attempt_count() !=
+            request->attempt_number()
+        ) {
+            return grpc::Status{
+                grpc::StatusCode::FAILED_PRECONDITION,
+                "attempt_number does not match the accepted "
+                "attempt"
+            };
+        }
+
+        if (
+            !coordinator_.is_job_assigned_to_worker(
+                job_id,
+                worker_id
+            )
+        ) {
+            return grpc::Status{
+                grpc::StatusCode::FAILED_PRECONDITION,
+                "worker_id does not match the worker whose "
+                "completion was accepted for this attempt"
+            };
+        }
+
+        const auto existing =
+            job_log_repository_.get(
+                job_id,
+                request->attempt_number(),
+                stream
+            );
+
+        if (existing.has_value()) {
+            const bool identical =
+                existing->worker_id == worker_id &&
+                existing->content == record.content &&
+                existing->original_byte_count ==
+                    record.original_byte_count &&
+                existing->truncated == record.truncated;
+
+            if (identical) {
+                return grpc::Status::OK;
+            }
+
+            radahn::coordinator::log_event(
+                "log_upload_failed",
+                {
+                    {"job_id", job_id.value()},
+                    {
+                        "attempt",
+                        std::to_string(request->attempt_number())
+                    },
+                    {"worker_id", worker_id.value()},
+                    {"reason", "conflicting_content"}
+                }
+            );
+
+            return grpc::Status{
+                grpc::StatusCode::ALREADY_EXISTS,
+                "Conflicting log content already stored for "
+                "this attempt and stream"
+            };
+        }
+
+        job_log_repository_.insert(
+            std::move(record)
+        );
+
+        return grpc::Status::OK;
+    } catch (const std::invalid_argument& error) {
+        return grpc::Status{
+            grpc::StatusCode::INVALID_ARGUMENT,
+            error.what()
+        };
+    } catch (const std::exception& error) {
+        return grpc::Status{
+            grpc::StatusCode::INTERNAL,
+            error.what()
+        };
+    }
+}
+
+grpc::Status CoordinatorServiceImpl::ListWorkers(
+    grpc::ServerContext* context,
+    const rpc::ListWorkersRequest* request,
+    rpc::ListWorkersResponse* response
+) {
+    static_cast<void>(context);
+    static_cast<void>(request);
+
+    try {
+        std::vector<domain::WorkerSnapshot> snapshots;
+
+        std::vector<
+            std::optional<
+                radahn::persistence::WorkerHeartbeatTimePoint
+            >
+        > heartbeats;
+
+        {
+            const std::lock_guard lock{mutex_};
+
+            snapshots = coordinator_.list_workers();
+
+            heartbeats.reserve(snapshots.size());
+
+            for (const auto& snapshot : snapshots) {
+                heartbeats.push_back(
+                    coordinator_.worker_last_heartbeat(
+                        snapshot.id()
+                    )
+                );
+            }
+        }
+
+        for (
+            std::size_t index = 0;
+            index < snapshots.size();
+            ++index
+        ) {
+            fill_worker_info(
+                snapshots[index],
+                heartbeats[index],
+                response->add_workers()
+            );
+        }
+
+        return grpc::Status::OK;
+    } catch (const std::exception& error) {
+        return grpc::Status{
+            grpc::StatusCode::INTERNAL,
+            error.what()
+        };
+    }
+}
+
+grpc::Status CoordinatorServiceImpl::GetWorker(
+    grpc::ServerContext* context,
+    const rpc::GetWorkerRequest* request,
+    rpc::GetWorkerResponse* response
+) {
+    static_cast<void>(context);
+
+    try {
+        const domain::WorkerId worker_id{
+            request->worker_id()
+        };
+
+        std::optional<domain::WorkerSnapshot> snapshot;
+
+        std::optional<
+            radahn::persistence::WorkerHeartbeatTimePoint
+        > heartbeat;
+
+        {
+            const std::lock_guard lock{mutex_};
+
+            snapshot = coordinator_.worker_snapshot(
+                worker_id
+            );
+
+            if (snapshot.has_value()) {
+                heartbeat =
+                    coordinator_.worker_last_heartbeat(
+                        worker_id
+                    );
+            }
+        }
+
+        if (!snapshot.has_value()) {
+            return grpc::Status{
+                grpc::StatusCode::NOT_FOUND,
+                "Worker was not found"
+            };
+        }
+
+        fill_worker_info(
+            *snapshot,
+            heartbeat,
+            response->mutable_worker()
         );
 
         return grpc::Status::OK;
