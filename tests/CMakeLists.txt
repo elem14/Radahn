@@ -633,6 +633,57 @@ add_test(
 )
 
 add_executable(
+    radahn-sqlite-transaction-tests
+    unit/sqlite_transaction_tests.cpp
+)
+
+target_link_libraries(
+    radahn-sqlite-transaction-tests
+    PRIVATE
+        radahn_coordinator
+        radahn_persistence
+        radahn_scheduler
+        radahn_domain
+        radahn_project_options
+        radahn_project_warnings
+)
+
+add_test(
+    NAME radahn.sqlite_transaction
+    COMMAND radahn-sqlite-transaction-tests
+)
+
+add_executable(
+    radahn-coordinator-rpc-integration-tests
+    unit/coordinator_rpc_integration_tests.cpp
+    ${CMAKE_SOURCE_DIR}/apps/coordinator/coordinator_service.cpp
+)
+
+target_include_directories(
+    radahn-coordinator-rpc-integration-tests
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/apps/coordinator
+)
+
+target_link_libraries(
+    radahn-coordinator-rpc-integration-tests
+    PRIVATE
+        radahn_coordinator
+        radahn_persistence
+        radahn_scheduler
+        radahn_domain
+        radahn_proto
+        radahn_workload_codec
+        radahn_project_options
+        radahn_project_warnings
+)
+
+add_test(
+    NAME radahn.coordinator_rpc_integration
+    COMMAND radahn-coordinator-rpc-integration-tests
+)
+
+add_executable(
     radahn-completion-reporter-tests
     unit/completion_reporter_tests.cpp
     ${CMAKE_SOURCE_DIR}/apps/worker/completion_reporter.cpp

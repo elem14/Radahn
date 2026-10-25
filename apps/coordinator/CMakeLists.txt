@@ -1,6 +1,7 @@
 add_executable(
     radahn-coordinator
     main.cpp
+    coordinator_service.cpp
 )
 
 target_link_libraries(

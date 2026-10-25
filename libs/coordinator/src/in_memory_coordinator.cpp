@@ -6,9 +6,11 @@
 #include <memory>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
+#include "radahn/domain/execution_result.hpp"
 #include "radahn/domain/job_state.hpp"
 
 #include "radahn/persistence/in_memory_job_repository.hpp"
@@ -17,9 +19,57 @@
 
 namespace radahn::coordinator {
 
+namespace {
+
+[[nodiscard]]
+persistence::NullTransactionRunner& null_transaction_runner() {
+    static persistence::NullTransactionRunner instance;
+    return instance;
+}
+
+/*
+ * A job can reach FAILED with no process result at all - every
+ * attempt was abandoned (worker disappeared, lease expired,
+ * coordinator restart) before any worker ever reported an exit
+ * code. MVP retry policy treats attempts-exhausted as terminal
+ * failure (see in_memory_coordinator.cpp's dispatch/finish/recovery
+ * paths), but the job still needs a clear, honest reason recorded -
+ * worker_error carries no exit code by construction, so this never
+ * invents one.
+ */
+[[nodiscard]]
+domain::ExecutionResult exhausted_attempts_result(
+    std::size_t attempt_count,
+    std::size_t max_attempts
+) {
+    return domain::ExecutionResult{
+        domain::ExecutionOutcome::worker_error,
+        std::nullopt,
+        std::nullopt,
+        "Job failed: exhausted " +
+        std::to_string(attempt_count) +
+        " of " +
+        std::to_string(max_attempts) +
+        " attempt(s) with no worker reporting a process result"
+    };
+}
+
+[[nodiscard]]
+persistence::ITransactionRunner& resolve_transaction_runner(
+    persistence::ITransactionRunner* transaction_runner
+) {
+    return
+        transaction_runner != nullptr
+            ? *transaction_runner
+            : null_transaction_runner();
+}
+
+}  // namespace
+
 InMemoryCoordinator::InMemoryCoordinator(
     scheduler::ISchedulingPolicy& policy,
-    std::chrono::milliseconds lease_duration
+    std::chrono::milliseconds lease_duration,
+    persistence::ITransactionRunner* transaction_runner
 )
     : owned_job_repository_{
           std::make_unique<
@@ -40,6 +90,11 @@ InMemoryCoordinator::InMemoryCoordinator(
       lease_duration_{
           lease_duration
       },
+      transaction_runner_{
+          resolve_transaction_runner(
+              transaction_runner
+          )
+      },
       planner_{policy} {
     if (
         lease_duration_ <=
@@ -57,12 +112,18 @@ InMemoryCoordinator::InMemoryCoordinator(
     scheduler::ISchedulingPolicy& policy,
     persistence::IJobRepository& job_repository,
     persistence::IWorkerRepository& worker_repository,
-    std::chrono::milliseconds lease_duration
+    std::chrono::milliseconds lease_duration,
+    persistence::ITransactionRunner* transaction_runner
 )
     : job_repository_{job_repository},
       worker_repository_{worker_repository},
       lease_duration_{
           lease_duration
+      },
+      transaction_runner_{
+          resolve_transaction_runner(
+              transaction_runner
+          )
       },
       planner_{policy} {
     if (
@@ -296,78 +357,79 @@ InMemoryCoordinator::mark_expired_job_leases(
         bool worker_updated = false;
 
         try {
-        
-            if (
-                record.assigned_worker_id
-                    .has_value()
-            ) {
-                auto worker =
-                    worker_repository_.get(
-                        *record.assigned_worker_id
-                    );
-
-                if (worker.has_value()) {
-                    const auto snapshot =
-                        worker->snapshot();
-
-                    if (
-                        snapshot.running_jobs() > 0
-                    ) {
-                        original_worker =
-                            *worker;
-
-                        worker->release(
-                            record.job.requirements()
+            transaction_runner_.run([&] {
+                if (
+                    record.assigned_worker_id
+                        .has_value()
+                ) {
+                    auto worker =
+                        worker_repository_.get(
+                            *record.assigned_worker_id
                         );
 
-                        worker_repository_.update(
-                            std::move(*worker)
-                        );
+                    if (worker.has_value()) {
+                        const auto snapshot =
+                            worker->snapshot();
 
-                        worker_updated = true;
+                        if (
+                            snapshot.running_jobs() > 0
+                        ) {
+                            original_worker =
+                                *worker;
+
+                            worker->release(
+                                record.job.requirements()
+                            );
+
+                            worker_repository_.update(
+                                std::move(*worker)
+                            );
+
+                            worker_updated = true;
+                        }
                     }
                 }
-            }
 
-            domain::JobState expired_state =
-                domain::JobState::retry_wait;
+                domain::JobState expired_state =
+                    domain::JobState::retry_wait;
 
-            if (
-                current_state ==
-                domain::JobState::
-                    cancellation_requested
-            ) {
-                expired_state =
-                    domain::JobState::cancelled;
-            }
+                if (
+                    current_state ==
+                    domain::JobState::
+                        cancellation_requested
+                ) {
+                    expired_state =
+                        domain::JobState::cancelled;
+                }
 
-            domain::Job expired_job =
-                domain::Job::restore(
-                    record.job.id(),
-                    record.job.name(),
-                    record.job.priority(),
-                    record.job.requirements(),
-                    record.job.workload(),
-                    expired_state,
-                    record.job.created_at(),
-                    record.job.attempt_count(),
-                    record.job.max_attempts()
+                domain::Job expired_job =
+                    domain::Job::restore(
+                        record.job.id(),
+                        record.job.name(),
+                        record.job.priority(),
+                        record.job.requirements(),
+                        record.job.workload(),
+                        expired_state,
+                        record.job.created_at(),
+                        record.job.attempt_count(),
+                        record.job.max_attempts()
+                    );
+
+                record.job =
+                    std::move(expired_job);
+
+                record.assigned_worker_id.reset();
+
+                record.lease_expires_at.reset();
+
+                job_repository_.update(
+                    record
                 );
-
-            record.job =
-                std::move(expired_job);
-
-            record.assigned_worker_id.reset();
-
-            record.lease_expires_at.reset();
-
-            job_repository_.update(
-                std::move(record)
-            );
+            });
 
             ++expired_count;
         } catch (...) {
-            
+
             if (
                 worker_updated &&
                 original_worker.has_value()
@@ -458,6 +520,12 @@ InMemoryCoordinator::requeue_retry_wait_jobs() {
 
     
         if (!record.job.can_attempt()) {
+            const auto attempt_count =
+                record.job.attempt_count();
+
+            const auto max_attempts =
+                record.job.max_attempts();
+
             record.job =
                 domain::Job::restore(
                     record.job.id(),
@@ -467,9 +535,18 @@ InMemoryCoordinator::requeue_retry_wait_jobs() {
                     record.job.workload(),
                     domain::JobState::failed,
                     record.job.created_at(),
-                    record.job.attempt_count(),
-                    record.job.max_attempts()
+                    attempt_count,
+                    max_attempts
                 );
+
+            if (!record.job.execution_result().has_value()) {
+                record.job.set_execution_result(
+                    exhausted_attempts_result(
+                        attempt_count,
+                        max_attempts
+                    )
+                );
+            }
 
             job_repository_.update(
                 std::move(record)
@@ -1106,48 +1183,52 @@ void InMemoryCoordinator::apply_dispatch_decision(
     bool job_repository_updated = false;
 
     try {
-        if (!selected_job->can_attempt()) {
-            throw std::logic_error{
-                "Scheduler selected a job that exhausted its retry limit"
-            };
-        }
+        transaction_runner_.run([&] {
+            if (!selected_job->can_attempt()) {
+                throw std::logic_error{
+                    "Scheduler selected a job that exhausted its retry limit"
+                };
+            }
 
-        selected_job->record_attempt();
+            selected_job->record_attempt();
 
-        worker->reserve(
-            selected_job->requirements()
-        );
+            worker->reserve(
+                selected_job->requirements()
+            );
 
-        selected_job->transition_to(
-            domain::JobState::leased
-        );
+            selected_job->transition_to(
+                domain::JobState::leased
+            );
 
-        stored_record->job =
-            std::move(*selected_job);
+            stored_record->job =
+                std::move(*selected_job);
 
-        stored_record->assigned_worker_id =
-            decision.worker_id;
+            stored_record->assigned_worker_id =
+                decision.worker_id;
 
-        stored_record->lease_expires_at = 
-            persistence::JobLeaseClock::now() +
-            lease_duration_;
+            stored_record->lease_expires_at =
+                persistence::JobLeaseClock::now() +
+                lease_duration_;
 
-        worker_repository_.update(
-            std::move(*worker)
-        );
+            worker_repository_.update(
+                std::move(*worker)
+            );
 
-        worker_repository_updated = true;
+            worker_repository_updated = true;
 
-        job_repository_.update(
-            std::move(*stored_record)
-        );
+            job_repository_.update(
+                std::move(*stored_record)
+            );
 
-        job_repository_updated = true;
+            job_repository_updated = true;
+        });
     } catch (...) {
         /*
-         * These compensating updates are sufficient for the
-         * in-memory implementation. SQLite will later use a real
-         * database transaction for this operation.
+         * For the in-memory backend these compensating updates are
+         * what actually restores consistency. For a SQLite backend,
+         * transaction_runner_ has already rolled back both writes
+         * atomically above; re-applying the original records here
+         * is a harmless, idempotent no-op in that case.
          */
         if (worker_repository_updated) {
             try {
@@ -1239,33 +1320,35 @@ void InMemoryCoordinator::finish_job(
     bool job_repository_updated = false;
 
     try {
-        worker->release(
-            record->job.requirements()
-        );
-
-        record->job.transition_to(
-            terminal_state
-        );
-
-        if (result.has_value()) {
-            record->job.set_execution_result(
-                std::move(*result)
+        transaction_runner_.run([&] {
+            worker->release(
+                record->job.requirements()
             );
-        }
 
-        record->lease_expires_at.reset();
+            record->job.transition_to(
+                terminal_state
+            );
 
-        worker_repository_.update(
-            std::move(*worker)
-        );
+            if (result.has_value()) {
+                record->job.set_execution_result(
+                    std::move(*result)
+                );
+            }
 
-        worker_repository_updated = true;
+            record->lease_expires_at.reset();
 
-        job_repository_.update(
-            std::move(*record)
-        );
+            worker_repository_.update(
+                std::move(*worker)
+            );
 
-        job_repository_updated = true;
+            worker_repository_updated = true;
+
+            job_repository_.update(
+                std::move(*record)
+            );
+
+            job_repository_updated = true;
+        });
     } catch (...) {
         if (worker_repository_updated) {
             try {
@@ -1340,6 +1423,12 @@ void InMemoryCoordinator::recover_persisted_state() {
                 * its attempts must not execute again.
                 */
                 if (!record.job.can_attempt()) {
+                    const auto attempt_count =
+                        record.job.attempt_count();
+
+                    const auto max_attempts =
+                        record.job.max_attempts();
+
                     record.job =
                         domain::Job::restore(
                             record.job.id(),
@@ -1349,9 +1438,18 @@ void InMemoryCoordinator::recover_persisted_state() {
                             record.job.workload(),
                             domain::JobState::failed,
                             record.job.created_at(),
-                            record.job.attempt_count(),
-                            record.job.max_attempts()
+                            attempt_count,
+                            max_attempts
                         );
+
+                    if (!record.job.execution_result().has_value()) {
+                        record.job.set_execution_result(
+                            exhausted_attempts_result(
+                                attempt_count,
+                                max_attempts
+                            )
+                        );
+                    }
 
                     job_repository_.update(
                         std::move(record)
@@ -1398,6 +1496,18 @@ void InMemoryCoordinator::recover_persisted_state() {
                         record.job.attempt_count(),
                         record.job.max_attempts()
                     );
+
+                if (
+                    recovered_state == domain::JobState::failed &&
+                    !recovered_job.execution_result().has_value()
+                ) {
+                    recovered_job.set_execution_result(
+                        exhausted_attempts_result(
+                            recovered_job.attempt_count(),
+                            recovered_job.max_attempts()
+                        )
+                    );
+                }
 
                 record.job =
                     recovered_job;

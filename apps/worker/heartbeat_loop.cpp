@@ -1,10 +1,12 @@
 #include "heartbeat_loop.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <iostream>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include <grpcpp/grpcpp.h>
 
@@ -42,13 +44,32 @@ std::chrono::milliseconds validate_interval(
     return interval;
 }
 
+[[nodiscard]]
+bool attempt_was_renewed(
+    const AttemptControlPtr& control,
+    const rpc::HeartbeatResponse& response
+) {
+    for (const auto& renewed : response.renewed_attempts()) {
+        if (
+            renewed.job_id() == control->job_id &&
+            renewed.attempt_number() ==
+                control->attempt_number
+        ) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 }  // namespace
 
 HeartbeatLoop::HeartbeatLoop(
     std::string coordinator_address,
     std::string worker_id,
     const ActiveJobRegistry& active_jobs,
-    std::chrono::milliseconds interval
+    std::chrono::milliseconds interval,
+    std::chrono::milliseconds unhealthy_after
 )
     : stub_{
           rpc::WorkerService::NewStub(
@@ -70,6 +91,7 @@ HeartbeatLoop::HeartbeatLoop(
       interval_{
           validate_interval(interval)
       },
+      unhealthy_after_{unhealthy_after},
       thread_{
           [this] {
               run();
@@ -78,7 +100,7 @@ HeartbeatLoop::HeartbeatLoop(
 }
 
 HeartbeatLoop::~HeartbeatLoop() {
-    
+
     stop_requested_.store(
         true
     );
@@ -90,13 +112,29 @@ HeartbeatLoop::~HeartbeatLoop() {
     }
 }
 
+bool HeartbeatLoop::is_connectivity_healthy() const noexcept {
+    return
+        std::chrono::steady_clock::now() -
+        last_success_.load() <
+        unhealthy_after_;
+}
+
 void HeartbeatLoop::run() {
     bool acknowledged_once = false;
 
     while (
         !stop_requested_.load()
     ) {
+        const auto active_snapshot =
+            active_jobs_.snapshot();
+
         grpc::ClientContext context;
+
+        // steady_clock for local deadline math (immune to wall-clock
+        // adjustments); system_clock because that is what
+        // grpc::ClientContext::set_deadline requires.
+        const auto send_time =
+            std::chrono::steady_clock::now();
 
         context.set_deadline(
             std::chrono::system_clock::now() +
@@ -109,9 +147,6 @@ void HeartbeatLoop::run() {
             worker_id_
         );
 
-        const auto active_snapshot =
-            active_jobs_.snapshot();
-
         for (
             const auto& attempt :
             active_snapshot
@@ -120,11 +155,11 @@ void HeartbeatLoop::run() {
                 request.add_active_attempts();
 
             active_attempt->set_job_id(
-                attempt.job_id
+                attempt->job_id
             );
 
             active_attempt->set_attempt_number(
-                attempt.attempt_number
+                attempt->attempt_number
             );
         }
 
@@ -146,19 +181,55 @@ void HeartbeatLoop::run() {
                 acknowledged_once = true;
             }
 
-            /*
-             * Renewal is never inferred merely because the RPC
-             * returned OK - only the attempts the coordinator
-             * explicitly names here were actually renewed.
-             */
-            if (
-                static_cast<std::size_t>(
-                    response.renewed_attempts_size()
-                ) != active_snapshot.size()
+            last_success_.store(
+                std::chrono::steady_clock::now()
+            );
+
+            const auto acknowledged_deadline =
+                send_time +
+                std::chrono::milliseconds{
+                    response.lease_duration_ms()
+                } -
+                lease_safety_margin;
+
+            std::size_t renewed_count = 0;
+
+            for (
+                const auto& attempt :
+                active_snapshot
             ) {
+                if (
+                    attempt_was_renewed(
+                        attempt,
+                        response
+                    )
+                ) {
+                    ++renewed_count;
+
+                    attempt->lease_deadline.store(
+                        acknowledged_deadline
+                    );
+
+                    continue;
+                }
+
+                /*
+                 * This attempt was reported as active but the
+                 * coordinator's response does not list it among the
+                 * renewed ones, despite the RPC itself succeeding -
+                 * that is an explicit rejection (the coordinator has
+                 * looked at this exact attempt and declined it, e.g.
+                 * because a newer attempt has superseded it), not a
+                 * transient failure. Ask it to stop immediately
+                 * rather than waiting for its local deadline.
+                 */
+                attempt->request_stop();
+            }
+
+            if (renewed_count != active_snapshot.size()) {
                 std::cerr
                     << "Heartbeat renewed "
-                    << response.renewed_attempts_size()
+                    << renewed_count
                     << " of "
                     << active_snapshot.size()
                     << " reported attempt(s)\n";
@@ -170,6 +241,29 @@ void HeartbeatLoop::run() {
                 << "Heartbeat RPC failed: "
                 << status.error_message()
                 << '\n';
+        }
+
+        /*
+         * Whether or not this tick's RPC succeeded, a job still
+         * running locally is never proof its lease remains valid -
+         * only an acknowledged deadline is. Enforce every attempt's
+         * own locally tracked deadline here so repeated heartbeat
+         * failure eventually requests termination instead of
+         * silently running forever.
+         */
+        const auto now = std::chrono::steady_clock::now();
+
+        for (
+            const auto& attempt :
+            active_snapshot
+        ) {
+            if (
+                attempt->phase.load() ==
+                    AttemptPhase::executing &&
+                now >= attempt->lease_deadline.load()
+            ) {
+                attempt->request_stop();
+            }
         }
 
         std::unique_lock lock{

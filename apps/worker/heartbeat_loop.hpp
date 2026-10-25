@@ -23,7 +23,16 @@ public:
         std::string worker_id,
         const ActiveJobRegistry& active_jobs,
         std::chrono::milliseconds interval =
-            std::chrono::seconds{2}
+            std::chrono::seconds{2},
+        /*
+         * How long coordinator connectivity may go without a single
+         * acknowledged heartbeat before new job acquisition should
+         * pause (see main.cpp). A short network interruption that
+         * clears well within this window never affects acquisition;
+         * only a prolonged one does.
+         */
+        std::chrono::milliseconds unhealthy_after =
+            std::chrono::seconds{10}
     );
 
     ~HeartbeatLoop();
@@ -44,6 +53,15 @@ public:
         HeartbeatLoop&&
     ) = delete;
 
+    /*
+     * False once coordinator connectivity has gone unhealthy_after
+     * without a single acknowledged heartbeat. Does not itself stop
+     * or extend any attempt - main.cpp uses it only to decide
+     * whether to pause acquiring new work.
+     */
+    [[nodiscard]]
+    bool is_connectivity_healthy() const noexcept;
+
 private:
     void run();
 
@@ -56,6 +74,10 @@ private:
     const ActiveJobRegistry& active_jobs_;
 
     std::chrono::milliseconds interval_;
+
+    std::chrono::milliseconds unhealthy_after_;
+
+    AtomicSteadyDeadline last_success_;
 
     std::atomic<bool> stop_requested_{
         false

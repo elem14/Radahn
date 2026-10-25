@@ -1354,9 +1354,7 @@ void rollback_preserving_original_error(
     SqliteDatabase& database
 ) noexcept {
     try {
-        database.execute(
-            "ROLLBACK;"
-        );
+        database.rollback_transaction();
     } catch (...) {
         // Preserve the original exception.
     }
@@ -1379,9 +1377,7 @@ void SqliteJobRepository::insert(
     sqlite3* database =
         database_.native_handle();
 
-    database_.execute(
-        "BEGIN IMMEDIATE TRANSACTION;"
-    );
+    database_.begin_transaction();
 
     try {
         auto statement =
@@ -1598,9 +1594,7 @@ void SqliteJobRepository::insert(
             record
         );
 
-        database_.execute(
-            "COMMIT;"
-        );
+        database_.commit_transaction();
     } catch (...) {
         rollback_preserving_original_error(
             database_
@@ -1626,9 +1620,7 @@ void SqliteJobRepository::update(
     sqlite3* database =
         database_.native_handle();
 
-    database_.execute(
-        "BEGIN IMMEDIATE TRANSACTION;"
-    );
+    database_.begin_transaction();
 
     try {
         auto statement =
@@ -1846,9 +1838,7 @@ void SqliteJobRepository::update(
             record
         );
 
-        database_.execute(
-            "COMMIT;"
-        );
+        database_.commit_transaction();
     } catch (...) {
         rollback_preserving_original_error(
             database_

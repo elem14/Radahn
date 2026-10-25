@@ -4,34 +4,32 @@
 
 namespace radahn::worker_app {
 
-void ActiveJobRegistry::add(
-    const ActiveAttempt& attempt
+AttemptControlPtr ActiveJobRegistry::add(
+    std::string job_id,
+    std::uint64_t attempt_number
 ) {
+    auto control =
+        std::make_shared<AttemptControl>(
+            std::move(job_id),
+            attempt_number
+        );
+
     const std::lock_guard lock{mutex_};
 
-    const auto iterator = std::find(
-        attempts_.begin(),
-        attempts_.end(),
-        attempt
-    );
+    attempts_.push_back(control);
 
-    // Reject an exact duplicate add rather than tracking it twice.
-    if (iterator != attempts_.end()) {
-        return;
-    }
-
-    attempts_.push_back(attempt);
+    return control;
 }
 
 void ActiveJobRegistry::remove(
-    const ActiveAttempt& attempt
+    const AttemptControlPtr& control
 ) {
     const std::lock_guard lock{mutex_};
 
     const auto iterator = std::find(
         attempts_.begin(),
         attempts_.end(),
-        attempt
+        control
     );
 
     if (iterator != attempts_.end()) {
@@ -39,7 +37,7 @@ void ActiveJobRegistry::remove(
     }
 }
 
-std::vector<ActiveAttempt>
+std::vector<AttemptControlPtr>
 ActiveJobRegistry::snapshot() const {
     const std::lock_guard lock{mutex_};
 

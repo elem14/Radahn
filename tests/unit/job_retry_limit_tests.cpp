@@ -299,6 +299,41 @@ void test_retry_limit() {
         "FAILED job preserves final attempt count"
     );
 
+    expect(
+        record.has_value() &&
+        record->job.execution_result().has_value(),
+        "A job failed by attempt exhaustion still carries a "
+        "job-level failure reason"
+    );
+
+    if (
+        record.has_value() &&
+        record->job.execution_result().has_value()
+    ) {
+        const auto& result =
+            *record->job.execution_result();
+
+        expect(
+            result.outcome ==
+                radahn::domain::ExecutionOutcome::worker_error,
+            "The exhaustion failure reason does not claim a "
+            "process outcome it never observed"
+        );
+
+        expect(
+            !result.exit_code.has_value() &&
+            !result.terminating_signal.has_value(),
+            "The exhaustion failure reason invents no exit code "
+            "or signal"
+        );
+
+        expect(
+            !result.diagnostic.empty(),
+            "The exhaustion failure reason has a human-readable "
+            "diagnostic"
+        );
+    }
+
     const auto third_dispatch =
         coordinator.dispatch_once_for_worker(
             worker_c

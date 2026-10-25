@@ -63,6 +63,16 @@ extern "C" void handle_shutdown_signal(int) {
     g_shutdown_requested.store(true);
 }
 
+/*
+ * Set only once the bounded shutdown drain's final reporting grace
+ * interval has elapsed (see main()'s drain loop). Completion
+ * reporting keeps retrying through the drain itself - only this
+ * flag, not g_shutdown_requested, cuts it off, so a short-running
+ * job's completion still gets a real chance to reach the
+ * coordinator during an ordinary shutdown.
+ */
+std::atomic<bool> g_abort_reporting{false};
+
 [[nodiscard]] unsigned int detected_cpu_count() {
     return std::max(
         1U,
@@ -244,6 +254,14 @@ struct WorkerConfig {
         default_max_concurrent_jobs(
             cpu_cores
         );
+
+    /*
+     * Bounded graceful-shutdown policy (see main()'s drain loop):
+     * how long a short-running job is given to finish normally
+     * after SIGINT/SIGTERM before remaining executions are
+     * forcibly terminated.
+     */
+    std::chrono::milliseconds shutdown_grace_ms{10000};
 };
 
 [[nodiscard]] WorkerConfig parse_worker_config(
@@ -330,6 +348,26 @@ struct WorkerConfig {
             config.tags.emplace_back(
                 argv[++index]
             );
+
+            continue;
+        }
+
+        if (argument == "--shutdown-grace-ms") {
+            if (index + 1 >= argc) {
+                throw std::invalid_argument{
+                    "--shutdown-grace-ms requires a value"
+                };
+            }
+
+            config.shutdown_grace_ms =
+                std::chrono::milliseconds{
+                    static_cast<std::int64_t>(
+                        parse_positive_count(
+                            argv[++index],
+                            "shutdown-grace-ms"
+                        )
+                    )
+                };
 
             continue;
         }
@@ -592,7 +630,8 @@ std::filesystem::path next_command_output_directory() {
 
 [[nodiscard]]
 radahn::domain::ExecutionResult execute_command_job(
-    const rpc::JobInfo& job
+    const rpc::JobInfo& job,
+    const radahn::worker_app::AttemptControlPtr& control
 ) {
     const auto workload =
         radahn::rpc_codec::decode_workload(
@@ -611,7 +650,12 @@ radahn::domain::ExecutionResult execute_command_job(
     const auto result =
         radahn::execution::execute_command(
             workload,
-            output_directory
+            output_directory,
+            radahn::execution::ExecutionControl{
+                radahn::execution::StopToken{
+                    &control->stop_requested
+                }
+            }
         );
 
     std::ostringstream output;
@@ -650,9 +694,63 @@ radahn::domain::ExecutionResult execute_command_job(
 }
 
 
+/*
+ * Sleep is an internal workload, not a subprocess, so it has no
+ * child process for a stop token to terminate - but it must still
+ * follow the same lifecycle as a command job: a lost lease or an
+ * explicit coordinator rejection has to interrupt it promptly rather
+ * than letting it run to completion regardless.
+ */
+[[nodiscard]]
+radahn::domain::ExecutionResult execute_sleep_job(
+    std::chrono::milliseconds duration,
+    const radahn::worker_app::AttemptControlPtr& control
+) {
+    constexpr std::chrono::milliseconds
+        poll_granularity{50};
+
+    auto remaining = duration;
+
+    while (
+        remaining >
+        std::chrono::milliseconds::zero()
+    ) {
+        if (control->stop_was_requested()) {
+            return radahn::domain::ExecutionResult{
+                radahn::domain::ExecutionOutcome::
+                    worker_stopped,
+                std::nullopt,
+                std::nullopt,
+                "Worker stopped execution"
+            };
+        }
+
+        const auto this_sleep =
+            std::min(
+                remaining,
+                poll_granularity
+            );
+
+        std::this_thread::sleep_for(
+            this_sleep
+        );
+
+        remaining -= this_sleep;
+    }
+
+    // Successful completion is represented as exit code 0.
+    return radahn::domain::ExecutionResult{
+        radahn::domain::ExecutionOutcome::exited,
+        0,
+        std::nullopt,
+        {}
+    };
+}
+
 [[nodiscard]]
 radahn::domain::ExecutionResult execute_job(
-    const rpc::JobInfo& job
+    const rpc::JobInfo& job,
+    const radahn::worker_app::AttemptControlPtr& control
 ) {
     if (!job.has_workload()) {
         throw std::invalid_argument{
@@ -664,7 +762,7 @@ radahn::domain::ExecutionResult execute_job(
         job.workload().kind() ==
         rpc::WORKLOAD_KIND_COMMAND
     ) {
-        return execute_command_job(job);
+        return execute_command_job(job, control);
     }
 
     const auto workload =
@@ -681,18 +779,10 @@ radahn::domain::ExecutionResult execute_job(
         };
     }
 
-    std::this_thread::sleep_for(
-        workload.sleep_duration()
+    return execute_sleep_job(
+        workload.sleep_duration(),
+        control
     );
-
-    // Sleep is an internal workload, not a subprocess
-    // Its successful completion is represented as exit code 0
-    return radahn::domain::ExecutionResult{
-        radahn::domain::ExecutionOutcome::exited,
-        0,
-        std::nullopt,
-        {}
-    };
 }
 
 }  // namespace
@@ -727,7 +817,8 @@ int main(int argc, char* argv[]) {
             << " [--disk-mib <n>]"
             << " [--gpu]"
             << " [--tag <tag>]..."
-            << " [--max-concurrent-jobs <n>]\n";
+            << " [--max-concurrent-jobs <n>]"
+            << " [--shutdown-grace-ms <n>]\n";
 
         return 1;
     }
@@ -844,6 +935,23 @@ int main(int argc, char* argv[]) {
             continue;
         }
 
+        if (!heartbeat_loop.is_connectivity_healthy()) {
+            /*
+             * Coordinator connectivity has been down long enough
+             * that a lease acquired now could already be
+             * unrenewable by the time it matters. Pause acquiring
+             * new work until a heartbeat succeeds again; in-flight
+             * attempts are unaffected - each one's own local
+             * deadline independently requests its termination if
+             * connectivity never recovers.
+             */
+            interruptible_sleep(
+                std::chrono::seconds{2}
+            );
+
+            continue;
+        }
+
         rpc::AcquireJobResponse response;
 
         const grpc::Status status =
@@ -900,6 +1008,16 @@ int main(int argc, char* argv[]) {
 
         rpc::StartJobResponse start_response;
 
+        /*
+         * Captured before the RPC, not after the response arrives -
+         * the lease clock on the coordinator started ticking no
+         * later than when it received this request, so anchoring
+         * the local deadline to the response's arrival time would
+         * overestimate remaining authority by the round-trip delay.
+         */
+        const auto start_send_time =
+            std::chrono::steady_clock::now();
+
         const grpc::Status start_status =
             start_job(
                 *stub,
@@ -946,13 +1064,19 @@ int main(int argc, char* argv[]) {
         const rpc::JobInfo job_info =
             start_response.job();
 
-        const radahn::worker_app::ActiveAttempt
-            active_attempt{
+        const auto control =
+            active_jobs.add(
                 job_id,
                 attempt_number
-            };
+            );
 
-        active_jobs.add(active_attempt);
+        control->lease_deadline.store(
+            start_send_time +
+            std::chrono::milliseconds{
+                start_response.lease_duration_ms()
+            } -
+            radahn::worker_app::lease_safety_margin
+        );
 
         try {
             running_jobs.push_back(
@@ -965,7 +1089,7 @@ int main(int argc, char* argv[]) {
                         job_id,
                         attempt_number,
                         job_info,
-                        active_attempt
+                        control
                     ]() {
 
                         radahn::domain::ExecutionResult result{
@@ -976,7 +1100,7 @@ int main(int argc, char* argv[]) {
                         };
 
                         try {
-                            result = execute_job(job_info);
+                            result = execute_job(job_info, control);
                         } catch (const std::exception& error) {
                             result = radahn::domain::ExecutionResult{
                                 radahn::domain::ExecutionOutcome::worker_error,
@@ -996,9 +1120,15 @@ int main(int argc, char* argv[]) {
                          * Execution is finished; this attempt
                          * enters its reporting phase. It stays
                          * registered for heartbeat renewal while
-                         * its completion is pending, but must not
-                         * be executed again.
+                         * its completion is pending, but there is
+                         * no child left to stop, and must not be
+                         * executed again.
                          */
+                        control->phase.store(
+                            radahn::worker_app::
+                                AttemptPhase::reporting
+                        );
+
                         radahn::worker_app::PendingCompletion
                             pending{
                                 radahn::worker_app::CompletionRecord{
@@ -1023,8 +1153,18 @@ int main(int argc, char* argv[]) {
                             reporter.report(
                                 pending.record,
                                 [] {
+                                    /*
+                                     * Deliberately not
+                                     * g_shutdown_requested: a
+                                     * shutdown signal alone must
+                                     * not cut reporting short -
+                                     * the bounded drain loop below
+                                     * only sets g_abort_reporting
+                                     * once its own final reporting
+                                     * grace interval elapses.
+                                     */
                                     return
-                                        !g_shutdown_requested
+                                        !g_abort_reporting
                                             .load();
                                 }
                             );
@@ -1080,7 +1220,7 @@ int main(int argc, char* argv[]) {
                                 break;
                         }
 
-                        active_jobs.remove(active_attempt);
+                        active_jobs.remove(control);
                     }
                 )
             );
@@ -1091,7 +1231,7 @@ int main(int argc, char* argv[]) {
              * lease expire naturally rather than renewing a
              * phantom task forever.
              */
-            active_jobs.remove(active_attempt);
+            active_jobs.remove(control);
 
             std::cerr
                 << "Could not launch execution for job "
@@ -1105,18 +1245,123 @@ int main(int argc, char* argv[]) {
     std::cout
         << "Shutdown requested; draining "
         << running_jobs.size()
-        << " in-flight job(s)...\n";
+        << " in-flight job(s) (grace "
+        << config.shutdown_grace_ms.count()
+        << "ms)...\n";
 
-    for (auto& job_future : running_jobs) {
-        try {
-            job_future.get();
-        } catch (const std::exception& error) {
-            std::cerr
-                << "Job execution thread raised"
-                << " during drain: "
-                << error.what()
-                << '\n';
+    /*
+     * Bounded graceful-shutdown policy:
+     *
+     * 1. New acquisition already stopped (the loop above exited).
+     * 2. Heartbeats and completion reporting continue unaffected
+     *    during the grace interval below - a short-running job's
+     *    completion still has a real chance to reach the
+     *    coordinator.
+     * 3. A short-running job simply finishes normally and is
+     *    reaped by the poll below before the grace deadline.
+     * 4. At the grace deadline, remaining executions are asked to
+     *    stop (SIGTERM, escalating to SIGKILL per
+     *    ExecutionControl::termination_grace / the sleep poll).
+     * 5. Completion reporting then gets one more bounded interval
+     *    (final_reporting_grace) before g_abort_reporting cuts it
+     *    off.
+     * 6. The loop below only returns once every execution task has
+     *    actually finished (joined) - std::future's destructor
+     *    would otherwise block on it anyway.
+     * 7. The heartbeat thread stops in its own destructor as this
+     *    function returns.
+     */
+    constexpr std::chrono::milliseconds
+        final_reporting_grace{5000};
+
+    constexpr std::chrono::milliseconds
+        drain_poll_interval{100};
+
+    const auto drain_deadline =
+        std::chrono::steady_clock::now() +
+        config.shutdown_grace_ms;
+
+    bool escalated = false;
+
+    std::chrono::steady_clock::time_point
+        reporting_abort_deadline{};
+
+    while (!running_jobs.empty()) {
+        running_jobs.erase(
+            std::remove_if(
+                running_jobs.begin(),
+                running_jobs.end(),
+                [](std::future<void>& job_future) {
+                    if (
+                        job_future.wait_for(
+                            std::chrono::seconds::zero()
+                        ) !=
+                        std::future_status::ready
+                    ) {
+                        return false;
+                    }
+
+                    try {
+                        job_future.get();
+                    } catch (
+                        const std::exception& error
+                    ) {
+                        std::cerr
+                            << "Job execution thread raised"
+                            << " during drain: "
+                            << error.what()
+                            << '\n';
+                    }
+
+                    return true;
+                }
+            ),
+            running_jobs.end()
+        );
+
+        if (running_jobs.empty()) {
+            break;
         }
+
+        const auto now =
+            std::chrono::steady_clock::now();
+
+        if (!escalated && now >= drain_deadline) {
+            std::cout
+                << "Shutdown grace period elapsed;"
+                << " terminating "
+                << running_jobs.size()
+                << " remaining execution(s)\n";
+
+            for (
+                const auto& attempt :
+                active_jobs.snapshot()
+            ) {
+                if (
+                    attempt->phase.load() ==
+                    radahn::worker_app::
+                        AttemptPhase::executing
+                ) {
+                    attempt->request_stop();
+                }
+            }
+
+            escalated = true;
+
+            reporting_abort_deadline =
+                now + final_reporting_grace;
+        }
+
+        if (
+            escalated &&
+            now >= reporting_abort_deadline
+        ) {
+            g_abort_reporting.store(true);
+        }
+
+        std::this_thread::sleep_for(
+            drain_poll_interval
+        );
     }
 
     std::cout

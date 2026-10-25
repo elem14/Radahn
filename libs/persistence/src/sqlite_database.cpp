@@ -227,6 +227,78 @@ std::int64_t SqliteDatabase::query_int64(
     );
 }
 
+void SqliteDatabase::begin_transaction() {
+    if (transaction_depth_ == 0) {
+        execute(
+            "BEGIN IMMEDIATE TRANSACTION;"
+        );
+    } else {
+        execute(
+            "SAVEPOINT radahn_sp_" +
+            std::to_string(transaction_depth_) +
+            ";"
+        );
+    }
+
+    ++transaction_depth_;
+}
+
+void SqliteDatabase::commit_transaction() {
+    if (transaction_depth_ <= 0) {
+        throw std::runtime_error{
+            "commit_transaction called without a matching "
+            "begin_transaction"
+        };
+    }
+
+    --transaction_depth_;
+
+    if (transaction_depth_ == 0) {
+        execute(
+            "COMMIT;"
+        );
+    } else {
+        execute(
+            "RELEASE SAVEPOINT radahn_sp_" +
+            std::to_string(transaction_depth_) +
+            ";"
+        );
+    }
+}
+
+void SqliteDatabase::rollback_transaction() {
+    if (transaction_depth_ <= 0) {
+        throw std::runtime_error{
+            "rollback_transaction called without a matching "
+            "begin_transaction"
+        };
+    }
+
+    --transaction_depth_;
+
+    if (transaction_depth_ == 0) {
+        execute(
+            "ROLLBACK;"
+        );
+    } else {
+        const auto savepoint_name =
+            "radahn_sp_" +
+            std::to_string(transaction_depth_);
+
+        execute(
+            "ROLLBACK TO SAVEPOINT " +
+            savepoint_name +
+            ";"
+        );
+
+        execute(
+            "RELEASE SAVEPOINT " +
+            savepoint_name +
+            ";"
+        );
+    }
+}
+
 sqlite3*
 SqliteDatabase::native_handle() const noexcept {
     return database_;

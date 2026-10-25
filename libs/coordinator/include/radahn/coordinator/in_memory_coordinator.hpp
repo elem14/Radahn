@@ -14,6 +14,7 @@
 #include "radahn/domain/worker_record.hpp"
 
 #include "radahn/persistence/job_repository.hpp"
+#include "radahn/persistence/transaction_runner.hpp"
 #include "radahn/persistence/worker_repository.hpp"
 
 #include "radahn/scheduler/dispatch_planner.hpp"
@@ -33,7 +34,9 @@ public:
     explicit InMemoryCoordinator(
         scheduler::ISchedulingPolicy& policy,
         std::chrono::milliseconds lease_duration =
-            std::chrono::seconds{15}
+            std::chrono::seconds{15},
+        persistence::ITransactionRunner* transaction_runner =
+            nullptr
     );
 
     // Dependency-injected constructor
@@ -41,8 +44,21 @@ public:
         scheduler::ISchedulingPolicy& policy,
         persistence::IJobRepository& job_repository,
         persistence::IWorkerRepository& worker_repository,
-        std::chrono::milliseconds lease_duration = 
-            std::chrono::seconds{15}
+        std::chrono::milliseconds lease_duration =
+            std::chrono::seconds{15},
+        /*
+         * nullptr (the default) uses a no-op runner, which is
+         * correct for the in-memory repositories tests normally
+         * inject here - they have no separate commit step, so
+         * apply_dispatch_decision / finish_job / lease reclamation
+         * already keep themselves consistent via their own
+         * compensating updates on exception. Production code (see
+         * apps/coordinator/main.cpp) passes a SqliteTransactionRunner
+         * so those same code paths commit or roll back both the job
+         * and worker repository writes as one durable unit.
+         */
+        persistence::ITransactionRunner* transaction_runner =
+            nullptr
     );
 
     void submit_job(
@@ -231,8 +247,11 @@ private:
     persistence::IWorkerRepository&
         worker_repository_;
 
-    std::chrono::milliseconds 
+    std::chrono::milliseconds
         lease_duration_;
+
+    persistence::ITransactionRunner&
+        transaction_runner_;
 
     /*
      * The queue is still transient scheduling state.
