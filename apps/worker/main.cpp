@@ -274,6 +274,40 @@ struct WorkerConfig {
     std::filesystem::path log_dir{"radahn-logs"};
 };
 
+void print_usage() {
+    std::cerr
+        << "Usage: radahn-worker"
+        << " [worker-id]"
+        << " [coordinator-address]"
+        << " [--cpu <cores>]"
+        << " [--memory-mib <n>]"
+        << " [--disk-mib <n>]"
+        << " [--gpu]"
+        << " [--tag <tag>]..."
+        << " [--max-concurrent-jobs <n>]"
+        << " [--shutdown-grace-ms <n>]"
+        << " [--log-dir <directory>]\n"
+        << "\n"
+        << "  worker-id              This worker's identifier"
+        << " (default: local-worker)\n"
+        << "  coordinator-address    Coordinator host:port to"
+        << " register and poll against (default: localhost:50051)\n"
+        << "\n"
+        << "Operating contract:\n"
+        << "  - Supported platforms: source builds on macOS and"
+        << " Linux only.\n"
+        << "  - Must reach the coordinator over the same network or"
+        << " a trusted VPN; there is no authentication and no"
+        << " transport encryption.\n"
+        << "  - CPU/memory/disk/GPU/tags only describe this worker"
+        << " to the scheduler; they are never enforced as OS"
+        << " resource limits on jobs it runs.\n"
+        << "  - worker-id must be unique across every"
+        << " simultaneously running worker process: two workers"
+        << " sharing an ID will silently overwrite each other's"
+        << " registration with the coordinator.\n";
+}
+
 [[nodiscard]] WorkerConfig parse_worker_config(
     int argc,
     char* argv[]
@@ -1067,6 +1101,18 @@ int main(int argc, char* argv[]) {
     std::cout << std::unitbuf;
     std::cerr << std::unitbuf;
 
+    for (int index = 1; index < argc; ++index) {
+        const std::string_view argument{
+            argv[index]
+        };
+
+        if (argument == "--help" || argument == "-h") {
+            print_usage();
+
+            return 0;
+        }
+    }
+
     WorkerConfig config;
 
     try {
@@ -1077,18 +1123,9 @@ int main(int argc, char* argv[]) {
     } catch (const std::invalid_argument& error) {
         std::cerr
             << error.what()
-            << '\n'
-            << "Usage: radahn-worker"
-            << " [worker-id]"
-            << " [coordinator-address]"
-            << " [--cpu <cores>]"
-            << " [--memory-mib <n>]"
-            << " [--disk-mib <n>]"
-            << " [--gpu]"
-            << " [--tag <tag>]..."
-            << " [--max-concurrent-jobs <n>]"
-            << " [--shutdown-grace-ms <n>]"
-            << " [--log-dir <directory>]\n";
+            << '\n';
+
+        print_usage();
 
         return 1;
     }
@@ -1111,7 +1148,33 @@ int main(int argc, char* argv[]) {
         << config.disk_bytes / (1024ULL * 1024ULL)
         << " MiB, GPU: "
         << (config.gpu_available ? "yes" : "no")
-        << '\n';
+        << '\n'
+        << "Tags:";
+
+    if (config.tags.empty()) {
+        std::cout << " none";
+    } else {
+        for (const auto& tag : config.tags) {
+            std::cout << ' ' << tag;
+        }
+    }
+
+    std::cout
+        << '\n'
+        << "Max concurrent jobs: "
+        << config.max_concurrent_jobs
+        << '\n'
+        << "Log directory: "
+        << config.log_dir.string()
+        << '\n'
+        << "Shutdown grace: "
+        << config.shutdown_grace_ms.count()
+        << " ms\n"
+        << "Authentication: none"
+        << " | Transport encryption: none"
+        << " (same-network or trusted-VPN connectivity required)\n"
+        << "Resource capacity above is a scheduling reservation"
+        << " only; it is not enforced as an OS resource limit\n";
 
     auto stub = make_stub(
         config.coordinator_address

@@ -813,6 +813,22 @@ grpc::Status CoordinatorServiceImpl::RegisterWorker(
 ) {
     static_cast<void>(context);
 
+    /*
+     * Documented MVP constraint, not an enforced one: a worker_id
+     * that is already registered is treated as the same worker
+     * reconnecting (e.g. after a restart) and its record is simply
+     * updated in place - there is nothing in this RPC that lets the
+     * coordinator distinguish that legitimate case from a second,
+     * independent worker process that was simply started with a
+     * colliding ID. Rejecting on collision would break the former
+     * case, which is the common one (a crashed/restarted worker
+     * re-registering with its own stable identity), so operators
+     * are instead required to keep worker_id unique across every
+     * simultaneously running worker process. Two workers sharing an
+     * ID will silently overwrite each other's resource/heartbeat
+     * record, which can misdirect jobs or under/over-count
+     * capacity.
+     */
     try {
         if (!request->has_resources()) {
             return grpc::Status{

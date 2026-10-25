@@ -1,5 +1,19 @@
 #include "radahn/execution/command_executor.hpp"
 
+/*
+ * This translation unit is POSIX-only: it spawns children with
+ * posix_spawnp, reaps them with waitpid, and signals their process
+ * group directly. Radahn supports source builds on macOS and Linux
+ * only (see steps 20-21's configuration-and-platforms review) - fail
+ * the build with a clear message on anything else rather than
+ * letting <spawn.h>/<sys/wait.h> fail to resolve with a wall of
+ * confusing missing-header errors, or worse, silently compiling
+ * against the wrong assumptions.
+ */
+#if !defined(__APPLE__) && !defined(__linux__)
+#error "radahn_execution requires POSIX process APIs (posix_spawn, waitpid, process groups) and only supports macOS and Linux source builds."
+#endif
+
 #include <cerrno>
 #include <chrono>
 #include <csignal>

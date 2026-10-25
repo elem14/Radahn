@@ -1,4 +1,5 @@
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -28,19 +29,29 @@ void print_usage() {
     std::cout
         << "Radahn distributed computing platform\n\n"
         << "Usage:\n"
-        << "  radahn version\n"
-        << "  radahn ping [message]\n"
-        << "  radahn job submit <id> <name> <priority>"
-        << " <cpu> <memory-mib> <disk-mib>"
+        << "  radahn [--coordinator <host:port>] version\n"
+        << "  radahn [--coordinator <host:port>] ping [message]\n"
+        << "  radahn [--coordinator <host:port>] job submit <id> <name>"
+        << " <priority> <cpu> <memory-mib> <disk-mib>"
         << " [--gpu] [--tag <tag>]... [--max-attempts <n>]"
         << " [--timeout-ms <n>]"
         << " [-- <executable> [args...]]\n"
-        << "  radahn job get <id>\n"
-        << "  radahn job list\n"
-        << "  radahn job logs <id> [--stderr] [--attempt <n>]\n"
-        << "  radahn worker list\n"
-        << "  radahn worker get <worker-id>\n"
-        << "  radahn help\n";
+        << "  radahn [--coordinator <host:port>] job get <id>\n"
+        << "  radahn [--coordinator <host:port>] job list\n"
+        << "  radahn [--coordinator <host:port>] job logs <id>"
+        << " [--stderr] [--attempt <n>]\n"
+        << "  radahn [--coordinator <host:port>] worker list\n"
+        << "  radahn [--coordinator <host:port>] worker get <worker-id>\n"
+        << "  radahn help\n"
+        << "\n"
+        << "  --coordinator <host:port>   Coordinator address to"
+        << " connect to for this invocation. Must come before the"
+        << " command. Overrides RADAHN_COORDINATOR_ADDRESS and the"
+        << " default (localhost:50051).\n"
+        << "\n"
+        << "Operating contract: there is no authentication and no"
+        << " transport encryption; connect only over a trusted"
+        << " network or VPN.\n";
 }
 
 [[nodiscard]] int parse_int(
@@ -495,14 +506,100 @@ void print_worker(
     }
 }
 
+constexpr std::string_view
+    default_coordinator_address = "localhost:50051";
+
+/*
+ * Resolves which coordinator this invocation talks to, and strips
+ * any leading "--coordinator <address>" / "--coordinator=<address>"
+ * global option off the front of argv so the rest of main() can go
+ * on indexing argv exactly as before. Only recognized immediately
+ * after the program name (before the command verb) - this keeps it
+ * out of the way of "job submit ... -- <executable> [args...]",
+ * whose own "--" separator and following tokens must never be
+ * treated as global options.
+ */
+[[nodiscard]] std::string resolve_coordinator_address(
+    int& argc,
+    char**& argv,
+    std::vector<char*>& storage
+) {
+    std::string address{
+        default_coordinator_address
+    };
+
+    if (
+        const char* environment_value =
+            std::getenv("RADAHN_COORDINATOR_ADDRESS")
+    ) {
+        if (*environment_value != '\0') {
+            address = environment_value;
+        }
+    }
+
+    storage.push_back(argv[0]);
+
+    int index = 1;
+
+    while (index < argc) {
+        const std::string_view argument{
+            argv[index]
+        };
+
+        if (argument == "--coordinator") {
+            if (index + 1 >= argc) {
+                throw std::invalid_argument{
+                    "--coordinator requires a value"
+                };
+            }
+
+            address = argv[index + 1];
+            index += 2;
+
+            continue;
+        }
+
+        constexpr std::string_view inline_prefix =
+            "--coordinator=";
+
+        if (argument.substr(0, inline_prefix.size()) ==
+            inline_prefix) {
+            address =
+                std::string{
+                    argument.substr(inline_prefix.size())
+                };
+
+            ++index;
+
+            continue;
+        }
+
+        break;
+    }
+
+    for (; index < argc; ++index) {
+        storage.push_back(argv[index]);
+    }
+
+    argc = static_cast<int>(storage.size());
+    argv = storage.data();
+
+    return address;
+}
+
 [[nodiscard]]
 std::unique_ptr<
     rpc::ClientService::Stub
 >
-make_stub() {
+make_stub(const std::string& address) {
+    std::cerr
+        << "Connecting to coordinator at "
+        << address
+        << '\n';
+
     const auto channel =
         grpc::CreateChannel(
-            "localhost:50051",
+            address,
             grpc::InsecureChannelCredentials()
         );
 
@@ -1133,6 +1230,26 @@ int main(
     int argc,
     char* argv[]
 ) {
+    std::vector<char*> argument_storage;
+    std::string coordinator_address;
+
+    try {
+        coordinator_address =
+            resolve_coordinator_address(
+                argc,
+                argv,
+                argument_storage
+            );
+    } catch (const std::exception& error) {
+        std::cerr
+            << error.what()
+            << '\n';
+
+        print_usage();
+
+        return 1;
+    }
+
     if (argc < 2) {
         print_usage();
         return 0;
@@ -1156,7 +1273,7 @@ int main(
         return 0;
     }
 
-    auto stub = make_stub();
+    auto stub = make_stub(coordinator_address);
 
     if (command == "ping") {
         std::string message{

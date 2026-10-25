@@ -1,7 +1,9 @@
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 
 #include <grpcpp/grpcpp.h>
 
@@ -11,6 +13,98 @@
 #include "coordinator_service.hpp"
 
 #include "radahn/domain/version.hpp"
+
+namespace {
+
+void print_usage() {
+    std::cerr
+        << "Usage: radahn-coordinator"
+        << " [database-path]"
+        << " [--listen-address <host:port>]\n"
+        << "\n"
+        << "  database-path       SQLite database file to create or"
+        << " open (default: ./radahn.db)\n"
+        << "  --listen-address    Address and port to accept"
+        << " connections on (default: 0.0.0.0:50051)\n"
+        << "\n"
+        << "Operating contract:\n"
+        << "  - Supported platforms: source builds on macOS and"
+        << " Linux only.\n"
+        << "  - Workers and clients must be able to reach this"
+        << " address directly, over the same network or a trusted"
+        << " VPN.\n"
+        << "  - There is no authentication and no transport"
+        << " encryption; do not expose this address beyond a"
+        << " trusted network.\n"
+        << "  - Worker CPU/memory/disk capacity is used only for"
+        << " scheduling reservations; it is never enforced as an OS"
+        << " resource limit.\n"
+        << "  - Every simultaneously running worker process must"
+        << " use a unique worker ID; this is required for correct"
+        << " behavior but is not rejected by the coordinator.\n";
+}
+
+struct CoordinatorConfig {
+    std::filesystem::path database_path{
+        "radahn.db"
+    };
+
+    std::string listen_address{
+        "0.0.0.0:50051"
+    };
+};
+
+[[nodiscard]] CoordinatorConfig parse_coordinator_config(
+    int argc,
+    char* argv[]
+) {
+    CoordinatorConfig config;
+
+    bool database_path_set = false;
+
+    for (int index = 1; index < argc; ++index) {
+        const std::string_view argument{
+            argv[index]
+        };
+
+        if (argument == "--listen-address") {
+            if (index + 1 >= argc) {
+                throw std::invalid_argument{
+                    "--listen-address requires a value"
+                };
+            }
+
+            config.listen_address = argv[++index];
+
+            continue;
+        }
+
+        if (
+            !argument.empty() &&
+            argument.front() == '-'
+        ) {
+            throw std::invalid_argument{
+                "Unknown flag: " +
+                std::string{argument}
+            };
+        }
+
+        if (database_path_set) {
+            throw std::invalid_argument{
+                "Too many positional arguments"
+            };
+        }
+
+        config.database_path =
+            std::filesystem::path{argument};
+
+        database_path_set = true;
+    }
+
+    return config;
+}
+
+}  // namespace
 
 int main(
     int argc,
@@ -26,41 +120,64 @@ int main(
     std::cout << std::unitbuf;
     std::cerr << std::unitbuf;
 
-    if (argc > 2) {
+    for (int index = 1; index < argc; ++index) {
+        const std::string_view argument{
+            argv[index]
+        };
+
+        if (argument == "--help" || argument == "-h") {
+            print_usage();
+
+            return 0;
+        }
+    }
+
+    CoordinatorConfig config;
+
+    try {
+        config = parse_coordinator_config(
+            argc,
+            argv
+        );
+    } catch (const std::invalid_argument& error) {
         std::cerr
-            << "Usage: radahn-coordinator"
-            << " [database-path]\n";
+            << error.what()
+            << '\n';
+
+        print_usage();
 
         return 1;
     }
 
-    /*
-     * Running without an argument creates or opens ./radahn.db
-     * Tests can pass a temporary database path instead
-     */
-    std::filesystem::path database_path{
-        "radahn.db"
-    };
+    const auto resolved_database_path =
+        std::filesystem::absolute(
+            config.database_path
+        );
 
-    if (argc == 2) {
-        database_path =
-            std::filesystem::path{
-                argv[1]
-            };
-    }
-
-    const std::string server_address{
-        "0.0.0.0:50051"
-    };
+    std::cout
+        << "Radahn Coordinator "
+        << radahn::domain::version()
+        << '\n'
+        << "Listen address: "
+        << config.listen_address
+        << '\n'
+        << "Database path: "
+        << resolved_database_path.string()
+        << '\n'
+        << "Authentication: none"
+        << " | Transport encryption: none"
+        << " (same-network or trusted-VPN connectivity required)\n"
+        << "Resource requirements (CPU/memory/disk) are scheduling"
+        << " reservations only; they are not enforced OS limits\n";
 
     try {
         radahn::coordinator_app::CoordinatorServiceImpl
-            service{database_path};
+            service{config.database_path};
 
         grpc::ServerBuilder builder;
 
         builder.AddListeningPort(
-            server_address,
+            config.listen_address,
             grpc::InsecureServerCredentials()
         );
 
@@ -86,19 +203,16 @@ int main(
 
         if (!server) {
             std::cerr
-                << "Failed to start Radahn Coordinator\n";
+                << "Failed to start Radahn Coordinator on "
+                << config.listen_address
+                << '\n';
 
             return 1;
         }
 
         std::cout
-            << "Radahn Coordinator "
-            << radahn::domain::version()
-            << " listening on "
-            << server_address
-            << '\n'
-            << "Database: "
-            << database_path.string()
+            << "Radahn Coordinator is listening on "
+            << config.listen_address
             << '\n';
 
         server->Wait();
