@@ -229,8 +229,14 @@ void test_retry_limit() {
         return;
     }
 
-    coordinator.mark_expired_job_leases(
-        *record->lease_expires_at
+    const auto first_expiration_count =
+        coordinator.mark_expired_job_leases(
+            *record->lease_expires_at
+        );
+
+    expect(
+        first_expiration_count == 1,
+        "First lease expires exactly once"
     );
 
     expect(
@@ -275,8 +281,14 @@ void test_retry_limit() {
         return;
     }
 
-    coordinator.mark_expired_job_leases(
-        *record->lease_expires_at
+    const auto second_expiration_count =
+        coordinator.mark_expired_job_leases(
+            *record->lease_expires_at
+        );
+
+    expect(
+        second_expiration_count == 1,
+        "Second lease expires exactly once"
     );
 
     expect(

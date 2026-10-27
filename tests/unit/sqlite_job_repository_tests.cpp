@@ -196,6 +196,7 @@ void test_insert_and_get() {
     repository.insert(
         JobRecord{
             make_job("job-1"),
+            std::nullopt,
             std::nullopt
         }
     );
@@ -303,6 +304,7 @@ void test_update_and_assignment() {
     repository.insert(
         JobRecord{
             make_job("job-update"),
+            std::nullopt,
             std::nullopt
         }
     );
@@ -372,6 +374,7 @@ void test_duplicate_and_unknown_operations() {
     repository.insert(
         JobRecord{
             make_job("duplicate-job"),
+            std::nullopt,
             std::nullopt
         }
     );
@@ -382,6 +385,7 @@ void test_duplicate_and_unknown_operations() {
         repository.insert(
             JobRecord{
                 make_job("duplicate-job"),
+                std::nullopt,
                 std::nullopt
             }
         );
@@ -402,6 +406,7 @@ void test_duplicate_and_unknown_operations() {
         repository.update(
             JobRecord{
                 make_job("unknown-job"),
+                std::nullopt,
                 std::nullopt
             }
         );
@@ -452,6 +457,7 @@ void test_list_and_erase() {
     repository.insert(
         JobRecord{
             make_job("job-a"),
+            std::nullopt,
             std::nullopt
         }
     );
@@ -459,6 +465,7 @@ void test_list_and_erase() {
     repository.insert(
         JobRecord{
             make_job("job-b"),
+            std::nullopt,
             std::nullopt
         }
     );
@@ -506,6 +513,7 @@ void test_data_survives_reopen() {
         repository.insert(
             JobRecord{
                 make_job("persistent-job"),
+                std::nullopt,
                 std::nullopt
             }
         );

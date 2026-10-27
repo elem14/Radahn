@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: [main, beta]
+  pull_request:
+  workflow_dispatch:
+
+# Pinned to the exact vcpkg commit named in vcpkg-configuration.json's
+# builtin-baseline, so the tool itself and the dependency baseline it
+# resolves against always move together.
+env:
+  VCPKG_COMMIT: 2475cc332a47b3a63bb3de58293bdab7726613ca
+  VCPKG_ROOT: ${{ github.workspace }}/.vcpkg
+
+jobs:
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install build tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build curl zip unzip tar pkg-config build-essential
+
+      - name: Install build tools (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja pkg-config
+
+      - name: Cache vcpkg tool and binary cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.VCPKG_ROOT }}
+            ~/.cache/vcpkg
+          key: vcpkg-${{ runner.os }}-${{ env.VCPKG_COMMIT }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: |
+            vcpkg-${{ runner.os }}-${{ env.VCPKG_COMMIT }}-
+
+      - name: Bootstrap vcpkg at the pinned commit
+        run: |
+          if [ ! -d "${VCPKG_ROOT}/.git" ]; then
+            rm -rf "${VCPKG_ROOT}"
+            git clone https://github.com/microsoft/vcpkg.git "${VCPKG_ROOT}"
+          fi
+          cd "${VCPKG_ROOT}"
+          git fetch --depth 1 origin "${VCPKG_COMMIT}"
+          git checkout "${VCPKG_COMMIT}"
+          ./bootstrap-vcpkg.sh -disableMetrics
+
+      - name: Configure (debug)
+        run: cmake --preset debug
+
+      - name: Build (debug)
+        run: cmake --build --preset debug
+
+      - name: Test (debug)
+        run: ctest --preset debug
+
+      - name: Run bounded MVP demo (debug)
+        timeout-minutes: 5
+        run: ./scripts/delta_mvp_demo.sh
+
+      - name: Configure (release)
+        run: cmake --preset release
+
+      - name: Build (release)
+        run: cmake --build --preset release
+
+      - name: Test (release)
+        run: ctest --preset release
+
+      - name: Preserve diagnostic logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: radahn-ci-logs-${{ matrix.os }}
+          path: |
+            build/debug/Testing/Temporary/*.log
+            build/release/Testing/Temporary/*.log
+            radahn-logs/**
+          if-no-files-found: ignore
+          retention-days: 7

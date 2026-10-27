@@ -119,6 +119,7 @@ void test_job_repository_insert_and_get() {
                 "Repository test",
                 50
             ),
+            std::nullopt,
             std::nullopt
         }
     );
@@ -174,6 +175,7 @@ void test_job_repository_rejects_duplicates() {
                 "First job",
                 10
             ),
+            std::nullopt,
             std::nullopt
         }
     );
@@ -188,6 +190,7 @@ void test_job_repository_rejects_duplicates() {
                     "Second job",
                     20
                 ),
+                std::nullopt,
                 std::nullopt
             }
         );
@@ -220,6 +223,7 @@ void test_job_repository_update() {
                 "Update test",
                 50
             ),
+            std::nullopt,
             std::nullopt
         }
     );
@@ -286,6 +290,7 @@ void test_job_repository_list_and_erase() {
                 "Job A",
                 10
             ),
+            std::nullopt,
             std::nullopt
         }
     );
@@ -297,6 +302,7 @@ void test_job_repository_list_and_erase() {
                 "Job B",
                 20
             ),
+            std::nullopt,
             std::nullopt
         }
     );
