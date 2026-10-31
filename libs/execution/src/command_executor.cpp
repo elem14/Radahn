@@ -250,17 +250,28 @@ ExecutionResult execute_command(
         0
     );
 
+    /*
+     * O_TRUNC, not O_EXCL: the parent directory above was just
+     * created exclusively, so stdout.log/stderr.log can never
+     * already exist here from another execution. O_EXCL would be
+     * pure redundancy against that - and on macOS it actively
+     * breaks spawning certain executables (observed with universal/
+     * fat Mach-O binaries such as python3): posix_spawn appears to
+     * internally retry applying file actions for these binaries,
+     * and the second O_EXCL open collides with the first, failing
+     * the whole spawn with EEXIST before the child ever execs.
+     */
     actions.open(
         STDOUT_FILENO,
         directory / "stdout.log",
-        O_WRONLY | O_CREAT | O_EXCL,
+        O_WRONLY | O_CREAT | O_TRUNC,
         0600
     );
 
     actions.open(
         STDERR_FILENO,
         directory / "stderr.log",
-        O_WRONLY | O_CREAT | O_EXCL,
+        O_WRONLY | O_CREAT | O_TRUNC,
         0600
     );
 
